@@ -230,11 +230,17 @@ class Repository:
         await Repository.set_setting(session, "paper_counter", "0")
 
     @staticmethod
-    async def cancel_and_refund_order(session: AsyncSession, order_id: int) -> Tuple[bool, str]:
+    async def cancel_and_refund_order(
+        session: AsyncSession,
+        order_id: int,
+        user_id: Optional[int] = None
+    ) -> Tuple[bool, str]:
         """Отмена заказа из очереди с автоматическим возвратом средств"""
         order = await session.get(Order, order_id)
         if not order:
             return False, "Заказ не найден."
+        if user_id is not None and order.user_id != user_id:
+            return False, "У вас нет прав на отмену этого заказа."
         if order.status not in (OrderStatus.QUEUED, OrderStatus.PENDING_PAYMENT, OrderStatus.PENDING_ADMIN_APPROVAL):
             return False, f"Заказ уже в статусе '{order.status.value}', отмена невозможна."
 

@@ -143,7 +143,7 @@ async def handle_document_upload(message: Message, bot: Bot, session: AsyncSessi
 async def cb_config_pages(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
     order_uuid = callback.data.split(":")[1]
     order = await Repository.get_order_by_uuid(session, order_uuid)
-    if not order or order.status != OrderStatus.PENDING_CONFIG:
+    if not order or order.user_id != callback.from_user.id or order.status != OrderStatus.PENDING_CONFIG:
         await callback.answer("Заказ уже не доступен для изменения.", show_alert=True)
         return
 
@@ -169,7 +169,7 @@ async def process_custom_pages(message: Message, state: FSMContext, session: Asy
     total_pages = data.get("total_pages", 1)
 
     order = await Repository.get_order_by_uuid(session, order_uuid)
-    if not order or order.status != OrderStatus.PENDING_CONFIG:
+    if not order or order.user_id != message.from_user.id or order.status != OrderStatus.PENDING_CONFIG:
         await message.answer("Заказ устарел или был отменен.")
         await state.clear()
         return
@@ -224,7 +224,7 @@ async def process_custom_pages(message: Message, state: FSMContext, session: Asy
 async def cb_config_copies(callback: CallbackQuery, session: AsyncSession):
     order_uuid = callback.data.split(":")[1]
     order = await Repository.get_order_by_uuid(session, order_uuid)
-    if not order or order.status != OrderStatus.PENDING_CONFIG:
+    if not order or order.user_id != callback.from_user.id or order.status != OrderStatus.PENDING_CONFIG:
         await callback.answer("Заказ уже не доступен для изменения.", show_alert=True)
         return
 
@@ -243,7 +243,7 @@ async def cb_set_copies(callback: CallbackQuery, session: AsyncSession):
     copies = int(parts[2])
 
     order = await Repository.get_order_by_uuid(session, order_uuid)
-    if not order or order.status != OrderStatus.PENDING_CONFIG:
+    if not order or order.user_id != callback.from_user.id or order.status != OrderStatus.PENDING_CONFIG:
         await callback.answer("Заказ не найден.", show_alert=True)
         return
 
@@ -293,7 +293,7 @@ async def cb_set_copies(callback: CallbackQuery, session: AsyncSession):
 async def cb_back_to_order(callback: CallbackQuery, session: AsyncSession):
     order_uuid = callback.data.split(":")[1]
     order = await Repository.get_order_by_uuid(session, order_uuid)
-    if not order:
+    if not order or order.user_id != callback.from_user.id:
         await callback.answer("Заказ не найден.", show_alert=True)
         return
 
@@ -318,9 +318,11 @@ async def cb_back_to_order(callback: CallbackQuery, session: AsyncSession):
 async def cb_cancel_order(callback: CallbackQuery, session: AsyncSession):
     order_uuid = callback.data.split(":")[1]
     order = await Repository.get_order_by_uuid(session, order_uuid)
-    if order:
-        DocumentService.cleanup_file(order.file_path)
-        await Repository.update_order_status(session, order.id, OrderStatus.CANCELLED)
+    if not order or order.user_id != callback.from_user.id:
+        await callback.answer("Заказ не найден.", show_alert=True)
+        return
+    DocumentService.cleanup_file(order.file_path)
+    await Repository.update_order_status(session, order.id, OrderStatus.CANCELLED)
     await callback.message.edit_text("❌ <b>Заказ отменен.</b> Файл удален из очереди.", parse_mode="HTML")
     await callback.answer()
 
@@ -329,7 +331,7 @@ async def cb_cancel_order(callback: CallbackQuery, session: AsyncSession):
 async def cb_pay_order(callback: CallbackQuery, session: AsyncSession):
     order_uuid = callback.data.split(":")[1]
     order = await Repository.get_order_by_uuid(session, order_uuid)
-    if not order or order.status not in (OrderStatus.PENDING_CONFIG, OrderStatus.PENDING_PAYMENT):
+    if not order or order.user_id != callback.from_user.id or order.status not in (OrderStatus.PENDING_CONFIG, OrderStatus.PENDING_PAYMENT):
         await callback.answer("Заказ недоступен для оплаты.", show_alert=True)
         return
 
@@ -367,7 +369,7 @@ async def cb_pay_order(callback: CallbackQuery, session: AsyncSession):
 async def cb_pay_balance(callback: CallbackQuery, session: AsyncSession):
     order_uuid = callback.data.split(":")[1]
     order = await Repository.get_order_by_uuid(session, order_uuid)
-    if not order or order.status != OrderStatus.PENDING_PAYMENT:
+    if not order or order.user_id != callback.from_user.id or order.status != OrderStatus.PENDING_PAYMENT:
         await callback.answer("Заказ уже оплачен или недоступен.", show_alert=True)
         return
 
@@ -411,7 +413,7 @@ async def cb_pay_sbp(callback: CallbackQuery, state: FSMContext, session: AsyncS
 
     order_uuid = callback.data.split(":")[1]
     order = await Repository.get_order_by_uuid(session, order_uuid)
-    if not order or order.status != OrderStatus.PENDING_PAYMENT:
+    if not order or order.user_id != callback.from_user.id or order.status != OrderStatus.PENDING_PAYMENT:
         await callback.answer("Заказ не найден или уже оплачен.", show_alert=True)
         return
 
@@ -449,7 +451,7 @@ async def process_sbp_receipt(message: Message, bot: Bot, state: FSMContext, ses
     cost_rub = data.get("cost_rub", 0.0)
 
     order = await Repository.get_order_by_uuid(session, order_uuid)
-    if not order or order.status != OrderStatus.PENDING_PAYMENT:
+    if not order or order.user_id != message.from_user.id or order.status != OrderStatus.PENDING_PAYMENT:
         await message.answer("Заказ уже обработан или отменен.")
         await state.clear()
         return
@@ -505,7 +507,7 @@ async def process_sbp_receipt(message: Message, bot: Bot, state: FSMContext, ses
 async def cb_pay_stars(callback: CallbackQuery, bot: Bot, session: AsyncSession):
     order_uuid = callback.data.split(":")[1]
     order = await Repository.get_order_by_uuid(session, order_uuid)
-    if not order or order.status != OrderStatus.PENDING_PAYMENT:
+    if not order or order.user_id != callback.from_user.id or order.status != OrderStatus.PENDING_PAYMENT:
         await callback.answer("Заказ не найден или уже оплачен.", show_alert=True)
         return
 
@@ -543,26 +545,26 @@ async def process_successful_payment(message: Message, session: AsyncSession):
             # Зачисляем транзакцию
             await Repository.update_balance(
                 session=session,
-                user_id=message.from_user.id,
+                user_id=order.user_id,
                 delta=order.cost_rub,
-                trans_type=TransactionType.DEPOSIT,
+                trans_type=TransactionType.TOPUP_TELEGRAM_STARS,
                 payment_method="stars",
-                order_id=order.id,
-                provider_payment_id=message.successful_payment.telegram_payment_charge_id
+                order_id=order.id
             )
             # Списываем за печать
             await Repository.update_balance(
                 session=session,
-                user_id=message.from_user.id,
+                user_id=order.user_id,
                 delta=-order.cost_rub,
                 trans_type=TransactionType.PRINT_CHARGE,
                 payment_method="stars",
                 order_id=order.id
             )
+            # Ставим в очередь
             await Repository.update_order_status(session, order.id, OrderStatus.QUEUED)
             await message.answer(
-                "🎉 <b>Оплата звездами Telegram успешно получена!</b>\n"
-                "Заказ отправлен в очередь на печать!",
+                f"🌟 <b>Оплата Telegram Stars подтверждена!</b>\n\n"
+                f"Заказ #{order.id} отправлен в очередь на принтер Pantum BP2300NW.",
                 reply_markup=get_cancel_queued_order_keyboard(order.id),
                 parse_mode="HTML"
             )
@@ -572,7 +574,7 @@ async def process_successful_payment(message: Message, session: AsyncSession):
 async def cb_user_cancel_queue(callback: CallbackQuery, session: AsyncSession):
     """Отмена заказа пользователем, пока он ждет очереди печати"""
     order_id = int(callback.data.split(":")[1])
-    success, msg = await Repository.cancel_and_refund_order(session, order_id)
+    success, msg = await Repository.cancel_and_refund_order(session, order_id, user_id=callback.from_user.id)
     if success:
         order = await Repository.get_order_by_id(session, order_id)
         if order:
