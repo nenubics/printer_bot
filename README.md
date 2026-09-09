@@ -164,59 +164,253 @@ printer_bot/
 
 ---
 
-## 🚀 Быстрый старт и установка
+---
 
-### 1. Клонирование и установка зависимостей
+## 🚀 Руководство по безопасному деплою от и до (Production Deployment Guide)
+
+Ниже приведена исчерпывающая пошаговая инструкция развертывания комплекса печати в общежитии ЦСО-4 с учетом противодействия студентам профиля информационной безопасности (КИИБ).
+
+### 📋 Чек-лист этапов внедрения:
+- [ ] **Этап 1**: Физическое подключение и сетевой периметр (Huawei AX3)
+- [ ] **Этап 2**: Аппаратный харденинг принтера Pantum BP2300NW
+- [ ] **Этап 3**: Подготовка операционной системы сервера (Linux / Ubuntu / RPi)
+- [ ] **Этап 4**: Установка проекта, прав доступа и файла `.env`
+- [ ] **Этап 5**: Предстартовая проверка и аудит защиты (40 тестов)
+- [ ] **Этап 6**: Запуск службы в режиме 24/7 (Systemd или Docker)
+- [ ] **Этап 7**: Пост-деплой проверка (Smoke Test) и регламент обслуживания
+
+---
+
+### Этап 1. Физическое подключение и сетевой периметр (Huawei WiFi AX3)
+
+1. **Подключение оборудования**:
+   - Подключите роутер **Huawei WiFi AX3** к электросети и интернету общежития.
+   - Подключите принтер **Pantum BP2300NW** к LAN-порту роутера сетевым кабелем Ethernet (наиболее надежный вариант) или настройте Wi-Fi подключение.
+   - Подключите сервер (Raspberry Pi / мини-ПК) к LAN-порту роутера.
+
+2. **Вход в панель управления роутером**:
+   - Перейдите в браузере по адресу `http://192.168.3.1`
+   - Если роутер новый — пройдите первичный мастер и **установите сложный пароль администратора роутера** (минимум 16–20 символов).
+
+3. **Резервирование статических IP-адресов (DHCP Static Lease / MAC Binding)**:
+   - В панели роутера: **Дополнительные функции** ➔ **Настройки сети** ➔ **LAN** ➔ **Статический IP**.
+   - Закрепите постоянные IP:
+     - **Принтер Pantum BP2300NW**: `192.168.3.100` (по MAC-адресу с наклейки принтера)
+     - **Сервер бота**: `192.168.3.50` (по MAC-адресу сетевой карты сервера)
+   - Это гарантирует, что адреса не изменятся при перезагрузках роутера.
+
+4. **Закрытие сетевых уязвимостей на роутере**:
+   - ❌ **Отключите WPS**: `Дополнительные функции ➔ Настройки Wi-Fi ➔ WPS ➔ Выключить` (блокирует атаку Pixie Dust / Reaver).
+   - ❌ **Отключите UPnP**: `Дополнительные функции ➔ Настройки безопасности ➔ UPnP ➔ Выключить` (блокирует скрытый проброс портов).
+   - ❌ **Отключите WAN-доступ**: убедитесь, что управление роутером из внешней сети общежития запрещено.
+   - ✅ **Включите AP Isolation (Изоляция точек доступа)**: `Настройки Wi-Fi ➔ Дополнительно ➔ AP Isolation ➔ Включить`.
+   - 🔒 **Выделенный скрытый Wi-Fi**: Создайте отдельную скрытую сеть (SSID) для инфраструктуры с `WPA3-SAE` или `WPA2-AES` со сложным паролем (24+ знака). **Никому не сообщайте пароль от этой сети** — студенты печатают через Telegram из любого места.
+
+---
+
+### Этап 2. Аппаратный харденинг принтера Pantum BP2300NW
+
+1. **Вход в веб-интерфейс принтера**:
+   - Откройте в браузере: `http://192.168.3.100` (IP принтера, заданный на этапе 1).
+   - Стандартный заводской логин/пароль: `admin` / `000000` (или `admin` / `admin`).
+
+2. **Смена пароля администратора принтера**:
+   - Перейдите в раздел управления пользователями/безопасностью.
+   - Смените дефолтный пароль на надежный (не менее 16 символов).
+
+3. **Настройка аппаратной IP-фильтрации (Access Control List / ACL) — ГЛАВНАЯ ЗАЩИТА!**:
+   - В веб-интерфейсе Pantum: **Настройки сети (Network Settings)** ➔ **IP-фильтр (IP Filter / Access Control)**.
+   - Включите фильтрацию (Enable IP Filtering).
+   - Добавьте правило: **Разрешить ТОЛЬКО IP-адрес сервера бота**: `192.168.3.50`.
+   - Для всех остальных IP-адресов подсети — **Запретить (Drop / Deny)**.
+   - *Результат*: Сетевой чип принтера аппаратно сбрасывает попытки подключения по портам 9100, 631, 80 с любых устройств, кроме вашего сервера. Бесплатная прямая печать мимо бота физически исключена.
+
+4. **Отключение неиспользуемых протоколов и служб анонсирования**:
+   - В разделе **Сетевые протоколы (Network Protocols)** отключите:
+     - ❌ **Bonjour / mDNS** и **AirPrint** (чтобы принтер не светился в телефонах студентов Apple/Android).
+     - ❌ **WS-Discovery (WSD)** (чтобы принтер не находился автоматически в Windows).
+     - ❌ **IPP (порт 631)** (так как бот работает напрямую через RAW-сокет 9100).
+     - ❌ **SNMP (порт 161)** (или смените community string `public` на случайный ключ).
+
+---
+
+### Этап 3. Подготовка операционной системы сервера (Linux / Ubuntu / RPi)
+
+Выполните на сервере, где будет работать бот:
+
+1. **Обновление системы и установка системных библиотек**:
+   ```bash
+   sudo apt update && sudo apt upgrade -y
+   sudo apt install -y python3 python3-venv python3-pip git libmagic1 poppler-utils ufw curl
+   ```
+
+2. **Создание изолированного системного пользователя (без sudo)**:
+   ```bash
+   sudo useradd -m -s /bin/bash printerbot
+   ```
+
+3. **Настройка фаервола UFW на сервере**:
+   ```bash
+   # Блокируем все входящие подключения по умолчанию
+   sudo ufw default deny incoming
+   sudo ufw default allow outgoing
+
+   # Разрешаем входящий SSH только с IP администратора
+   sudo ufw allow from 192.168.3.0/24 to any port 22 proto tcp
+
+   # Включаем фаервол
+   sudo ufw --force enable
+   ```
+
+---
+
+### Этап 4. Установка проекта, настройка прав и файла `.env`
+
+1. **Клонирование репозитория от имени пользователя `printerbot`**:
+   ```bash
+   sudo -u printerbot git clone git@github.com:nenubics/printer_bot.git /home/printerbot/printer_bot
+   cd /home/printerbot/printer_bot
+   ```
+
+2. **Создание виртуального окружения и установка Python-зависимостей**:
+   ```bash
+   sudo -u printerbot python3 -m venv venv
+   sudo -u printerbot ./venv/bin/pip install --upgrade pip
+   sudo -u printerbot ./venv/bin/pip install -r requirements.txt
+   ```
+
+3. **Создание и изоляция конфигурационного файла `.env`**:
+   ```bash
+   sudo -u printerbot cp .env.example .env
+   # Устанавливаем строгие права: читать и писать может ТОЛЬКО владелец файла
+   sudo chmod 600 .env
+   ```
+
+4. **Заполнение параметров в `.env`**:
+   Откройте `.env` в редакторе (`sudo -u printerbot nano .env`) и укажите реальные параметры:
+   ```ini
+   # 1. Telegram Bot (токен от @BotFather)
+   BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
+   
+   # 2. Telegram ID администраторов комнаты печати (узнать свой ID: @userinfobot)
+   ADMIN_IDS=123456789,987654321
+   
+   # 3. Сетевой режим печати Pantum BP2300NW через роутер Huawei AX3
+   PRINTER_MODE=raw
+   PRINTER_HOST=192.168.3.100
+   PRINTER_PORT=9100
+   PRINTER_NAME=Pantum_BP2300NW
+   
+   # 4. Базовый тариф и лимиты
+   PRICE_PER_PAGE_RUB=5.0
+   MAX_FILE_SIZE_BYTES=36700160
+   MAX_PAGES_PER_JOB=200
+   MAX_COPIES_PER_JOB=20
+   MAX_SHEETS_PER_ORDER=150
+   
+   # 5. Банковские реквизиты СБП для оплаты и пополнения баланса
+   PAYMENT_MODE=manual_sbp
+   SBP_PHONE=+7 (999) 000-00-00
+   SBP_BANK=Т-Банк / Сбербанк
+   SBP_RECIPIENT_NAME=Иван И.
+   ```
+
+---
+
+### Этап 5. Предстартовое тестирование и аудит безопасности
+
+Перед переводом бота в боевой режим обязательно выполните предстартовую диагностику:
+
+1. **Запуск полного набора автоматических тестов (40 тестов)**:
+   ```bash
+   sudo -u printerbot ./venv/bin/python -m unittest discover tests -v
+   ```
+   *Все 40 тестов должны завершиться со статусом `OK`.*
+
+2. **Запуск экспресс-аудита защиты от атак КИИБ**:
+   ```bash
+   sudo -u printerbot ./venv/bin/python scripts/verify_kiib_defense.py
+   ```
+   *Проверяет корректность прав `0700/0600`, свободное место на диске, антифлуд и отсев вредоносных чеков.*
+
+3. **Сетевая проверка видимости принтера Pantum по порту 9100**:
+   ```bash
+   sudo -u printerbot ./venv/bin/python scripts/scan_huawei_ax3.py
+   ```
+   *Скрипт подтвердит доступность порта 9100 на IP `192.168.3.100`.*
+
+---
+
+### Этап 6. Настройка автозапуска службы 24/7
+
+Выберите один из двух вариантов запуска:
+
+#### Вариант А: Systemd Daemon (Рекомендуется для Linux / Raspberry Pi)
+1. Проверьте конфигурационный файл `systemd/printer_bot.service`:
+   ```ini
+   [Unit]
+   Description=CSO-4 Pantum BP2300NW Telegram Print Bot
+   After=network.target network-online.target
+   Wants=network-online.target
+
+   [Service]
+   Type=simple
+   User=printerbot
+   Group=printerbot
+   WorkingDirectory=/home/printerbot/printer_bot
+   ExecStart=/home/printerbot/printer_bot/venv/bin/python main.py
+   Restart=always
+   RestartSec=5s
+   StandardOutput=journal
+   StandardError=journal
+   LimitNOFILE=65536
+   ProtectSystem=full
+   PrivateTmp=true
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+2. Установите и запустите службу:
+   ```bash
+   sudo cp systemd/printer_bot.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now printer_bot
+   ```
+3. Проверьте статус и логи:
+   ```bash
+   sudo systemctl status printer_bot
+   sudo journalctl -u printer_bot -f -n 50
+   ```
+
+#### Вариант Б: Docker Compose (Изолированный контейнер)
 ```bash
-git clone <URL_ВАШЕГО_РЕПОЗИТОРИЯ>
-cd printer_bot
-
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+docker compose up -d --build
+docker compose logs -f
 ```
 
-### 2. Настройка файла конфигурации `.env`
-Создайте `.env` из примера:
-```bash
-cp .env.example .env
-```
-Заполните параметры:
-```ini
-# Токен бота из @BotFather
-BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
+---
 
-# Telegram ID администраторов через запятую
-ADMIN_IDS=[123456789]
+### Этап 7. Финальная валидация (Smoke Test) и регламент обслуживания
 
-# Режим принтера: 'raw' (прямой сокет через Huawei AX3), 'cups' или 'mock' (симуляция)
-PRINTER_MODE=raw
-PRINTER_HOST=192.168.3.50
-PRINTER_PORT=9100
-PRINTER_NAME=Pantum_BP2300NW
+1. **Проверка в Telegram**:
+   - Откройте бота с аккаунта администратора и отправьте `/start`.
+   - Отправьте команду `/admin` ➔ нажмите кнопку **«🖨 Статус оборудования»**. Убедитесь, что получен ответ `Готовность: ✅ ГОТОВ`.
+2. **Тестовая печать**:
+   - Начислите тестовый баланс: `/give <ваш_user_id> 50`.
+   - Загрузите PDF-документ из 1–2 страниц.
+   - Выберите оплату с баланса.
+   - Убедитесь, что задание ушло на принтер Pantum, отпечаталось, а бот прислал уведомление о готовности.
+3. **Загрузка бумаги**:
+   - Загрузите пачку бумаги в лоток Pantum BP2300NW (вмещает до 150 листов).
+   - В панели администратора нажмите кнопку **«📄 Бумага пополнена (Сброс)»**.
+4. **Резервное копирование базы данных (Бэкап)**:
+   - Настройте cron для ежедневного горячего бэкапа SQLite (`sqlite3` поддерживает бэкап без остановки бота):
+   ```bash
+   # Добавьте в crontab пользователя printerbot:
+   # crontab -e
+   0 3 * * * sqlite3 /home/printerbot/printer_bot/data/printer_bot.db ".backup '/home/printerbot/backup_$(date +\%F).db'"
+   ```
 
-# Тарифы и реквизиты СБП
-PRICE_PER_PAGE=5.00
-SBP_PHONE=+79991234567
-SBP_BANK=Сбербанк
-SBP_RECIPIENT=Иван И.
-```
-
-### 3. Запуск тестов и аудита безопасности
-Убедитесь, что все компоненты функционируют безошибочно (40 тестов):
-```bash
-./venv/bin/python -m unittest discover tests -v
-```
-
-Запуск экспресс-аудита защиты от атак КИИБ:
-```bash
-./venv/bin/python scripts/verify_kiib_defense.py
-```
-
-### 4. Запуск бота
-```bash
-./venv/bin/python main.py
-```
 
 ---
 
@@ -285,35 +479,6 @@ SBP_RECIPIENT=Иван И.
 
 ---
 
-## 🔄 Развертывание 24/7
-
-### Вариант 1: Docker Compose (Рекомендуется)
-Контейнер изолирован, автоматически перезапускается при сбоях и регулярно проверяется встроенным healthcheck-скриптом:
-
-```bash
-docker compose up -d --build
-```
-Просмотр логов:
-```bash
-docker compose logs -f
-```
-
-### Вариант 2: Systemd Unit (Linux / Ubuntu / Raspberry Pi)
-1. Отредактируйте `systemd/printer_bot.service`, указав правильного пользователя и путь к проекту.
-2. Скопируйте файл в системную директорию:
-   ```bash
-   sudo cp systemd/printer_bot.service /etc/systemd/system/
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now printer_bot
-   ```
-3. Просмотр статуса и логов:
-   ```bash
-   sudo systemctl status printer_bot
-   sudo journalctl -u printer_bot -f
-   ```
-
----
-
 ## 👨‍💼 Панель администратора
 
 Команда `/admin` в Telegram открывает панель управления с клавиатурой:
@@ -328,28 +493,19 @@ docker compose logs -f
 
 ---
 
-## 📤 Подготовка к пушу в Git
+## 🌐 Репозиторий GitHub
 
-Все служебные файлы, секретные ключи `.env`, базы данных SQLite и временные файлы спула уже добавлены в `.gitignore`.
+Проект опубликован и поддерживается в репозитории:
+- **URL**: [https://github.com/nenubics/printer_bot](https://github.com/nenubics/printer_bot)
+- **SSH**: `git@github.com:nenubics/printer_bot.git`
+- **Ветка**: `main`
 
-Когда вы будете готовы отправить код в репозиторий (GitHub, GitLab или другой Git):
-
+Для получения свежих обновлений на боевом сервере:
 ```bash
-# 1. Инициализация локального репозитория
-git init
-
-# 2. Добавление файлов под контроль версий
-git add .
-
-# 3. Фиксация первого коммита
-git commit -m "feat: initial secure production release of Pantum BP2300NW print bot"
-
-# 4. Подключение удаленного репозитория (замените URL на ваш)
-git remote add origin <URL_ВАШЕГО_РЕПОЗИТОРИЯ>
-git branch -M main
-
-# 5. Отправка в ветку main
-git push -u origin main
+cd /home/printerbot/printer_bot
+sudo -u printerbot git pull origin main
+sudo -u printerbot ./venv/bin/pip install -r requirements.txt
+sudo systemctl restart printer_bot
 ```
 
 ---
