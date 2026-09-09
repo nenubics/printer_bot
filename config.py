@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     DATA_DIR: Path = Field(default=Path("data"), description="Папка для хранения данных")
     SPOOL_DIR: Path = Field(default=Path("data/spool"), description="Папка для временных файлов печати")
     DB_PATH: Path = Field(default=Path("data/printer_bot.db"), description="Путь к SQLite БД")
+    MIN_FREE_DISK_MB: int = Field(default=500, description="Минимальный свободный объем диска для приема файлов (МБ)")
+    MAX_PENDING_ORDERS_PER_USER: int = Field(default=3, description="Максимум неоплаченных заказов на одного пользователя (защита от переполнения спула)")
+    MAX_PENDING_DEPOSITS_PER_USER: int = Field(default=2, description="Максимум неподтвержденных чеков на пополнение на пользователя")
+    SPOOL_CLEANUP_HOURS: int = Field(default=2, description="Время жизни неоплаченных файлов в спуле (часы)")
 
     # Printing & Limits (Security / Hardware Protection)
     MAX_FILE_SIZE_BYTES: int = Field(default=35 * 1024 * 1024, description="Максимальный размер файла (35 МБ)")
@@ -46,6 +50,8 @@ class Settings(BaseSettings):
 
     # Anti-flood & Safety
     RATE_LIMIT_DELAY: float = Field(default=0.8, description="Минимальный интервал между сообщениями (сек)")
+    RATE_LIMIT_BURST_COUNT: int = Field(default=5, description="Число быстрых запросов до включения временного бана")
+    RATE_LIMIT_BLOCK_SECONDS: float = Field(default=30.0, description="Длительность временного бана при флуде (сек)")
     EMERGENCY_STOP: bool = Field(default=False, description="Экстренная остановка очереди печати")
 
     @field_validator("ADMIN_IDS", mode="before")

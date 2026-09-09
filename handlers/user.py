@@ -50,6 +50,17 @@ async def handle_document_upload(message: Message, bot: Bot, session: AsyncSessi
         )
         return
 
+    # Защита от спама файлами и DoS диска: квота на незавершенные заказы
+    pending_count = await Repository.get_user_pending_orders_count(session, message.from_user.id)
+    if pending_count >= settings.MAX_PENDING_ORDERS_PER_USER:
+        await message.answer(
+            f"⚠️ <b>Превышен лимит активных заказов!</b>\n"
+            f"У вас уже открыто {pending_count} незавершенных заказов.\n"
+            f"Пожалуйста, оплатите или отмените предыдущие заказы перед загрузкой новых.",
+            parse_mode="HTML"
+        )
+        return
+
     status_msg = await message.answer("⏳ <i>Проверяю файл и считаю страницы...</i>", parse_mode="HTML")
 
     original_filename = "document.pdf"
@@ -458,6 +469,20 @@ async def process_sbp_receipt(message: Message, bot: Bot, state: FSMContext, ses
 
     # Получаем file_id чека
     proof_file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+    orig_name = message.document.file_name if message.document else "receipt.jpg"
+
+    # Валидация файла чека от вредоносных вложений
+    try:
+        file_info = await bot.get_file(proof_file_id)
+        if (file_info.file_size or 0) > 5 * 1024 * 1024:
+            await message.answer("❌ Файл чека слишком большой! Максимальный размер чека: 5 МБ.")
+            return
+        file_stream = io.BytesIO()
+        await bot.download_file(file_info.file_path, destination=file_stream)
+        DocumentService.validate_receipt_file(file_stream.getvalue(), original_name=orig_name)
+    except DocumentSecurityError as e:
+        await message.answer(f"❌ {str(e)}\nПожалуйста, отправьте фото чека или PDF-квитанцию.")
+        return
 
     # Обновляем статус заказа
     await Repository.update_order_status(session, order.id, OrderStatus.PENDING_ADMIN_APPROVAL)
@@ -529,8 +554,23 @@ async def cb_pay_stars(callback: CallbackQuery, bot: Bot, session: AsyncSession)
 
 
 @user_router.pre_checkout_query()
-async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery, bot: Bot):
-    """Подтверждение готовности принять платеж"""
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery, bot: Bot, session: AsyncSession):
+    """Подтверждение готовности принять платеж Telegram Stars с валидацией заказа"""
+    payload = pre_checkout_query.invoice_payload
+    if not payload or not payload.startswith("stars_order:"):
+        await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Некорректные параметры платежа.")
+        return
+
+    order_uuid = payload.split(":")[1]
+    order = await Repository.get_order_by_uuid(session, order_uuid)
+    if not order or order.user_id != pre_checkout_query.from_user.id:
+        await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Заказ не найден.")
+        return
+
+    if order.status != OrderStatus.PENDING_PAYMENT:
+        await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=False, error_message="Заказ уже оплачен или отменен.")
+        return
+
     await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
 
 
@@ -665,9 +705,35 @@ async def _send_topup_instructions(target_msg: Message, state: FSMContext, amoun
 async def process_topup_receipt(message: Message, bot: Bot, state: FSMContext, session: AsyncSession):
     data = await state.get_data()
     amount = data.get("deposit_amount", 0.0)
-    await state.clear()
+
+    # 1. Проверка квоты на активные заявки на пополнение
+    pending_dep = await Repository.get_user_pending_deposits_count(session, message.from_user.id)
+    if pending_dep >= settings.MAX_PENDING_DEPOSITS_PER_USER:
+        await message.answer(
+            f"⚠️ <b>У вас уже есть {pending_dep} неподтвержденных заявок на пополнение.</b>\n"
+            f"Пожалуйста, дождитесь проверки администратором перед отправкой новых чеков.",
+            parse_mode="HTML"
+        )
+        await state.clear()
+        return
 
     proof_file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+    orig_name = message.document.file_name if message.document else "deposit.jpg"
+
+    # 2. Валидация файла чека от вредоносных вложений
+    try:
+        file_info = await bot.get_file(proof_file_id)
+        if (file_info.file_size or 0) > 5 * 1024 * 1024:
+            await message.answer("❌ Файл чека слишком большой! Максимальный размер: 5 МБ.")
+            return
+        file_stream = io.BytesIO()
+        await bot.download_file(file_info.file_path, destination=file_stream)
+        DocumentService.validate_receipt_file(file_stream.getvalue(), original_name=orig_name)
+    except DocumentSecurityError as e:
+        await message.answer(f"❌ {str(e)}\nПожалуйста, отправьте фото чека или PDF-квитанцию.")
+        return
+
+    await state.clear()
 
     # Создаем pending транзакцию
     from database.models import Transaction, TransactionType, TransactionStatus

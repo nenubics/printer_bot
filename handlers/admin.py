@@ -114,13 +114,14 @@ async def cb_admin_approve_sbp(callback: CallbackQuery, bot: Bot, session: Async
 
     parts = callback.data.split(":")
     order_uuid = parts[1]
-    user_id = int(parts[2])
-    amount = float(parts[3])
 
     order = await Repository.get_order_by_uuid(session, order_uuid)
     if not order or order.status != OrderStatus.PENDING_ADMIN_APPROVAL:
         await callback.answer("Заказ уже обработан другим администратором.", show_alert=True)
         return
+
+    user_id = order.user_id
+    amount = order.cost_rub
 
     # Зачисляем платеж на баланс и списываем за заказ
     await Repository.update_balance(
@@ -279,13 +280,14 @@ async def cb_admin_approve_deposit(callback: CallbackQuery, bot: Bot, session: A
 
     parts = callback.data.split(":")
     tx_id = int(parts[1])
-    user_id = int(parts[2])
-    amount = float(parts[3])
 
     tx = await session.get(Transaction, tx_id)
     if not tx or tx.status != TransactionStatus.PENDING:
         await callback.answer("Заявка уже обработана.", show_alert=True)
         return
+
+    user_id = tx.user_id
+    amount = tx.amount
 
     tx.status = TransactionStatus.SUCCEEDED
     success, new_bal, msg = await Repository.update_balance(

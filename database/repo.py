@@ -263,6 +263,58 @@ class Repository:
         return True, "Заказ отменен, средства возвращены на баланс."
 
     @staticmethod
+    async def get_user_pending_orders_count(session: AsyncSession, user_id: int) -> int:
+        """Подсчет активных неоплаченных заказов пользователя (защита от переполнения спула)"""
+        stmt = select(func.count(Order.id)).where(
+            Order.user_id == user_id,
+            Order.status.in_([
+                OrderStatus.PENDING_CONFIG,
+                OrderStatus.PENDING_PAYMENT,
+                OrderStatus.PENDING_ADMIN_APPROVAL
+            ])
+        )
+        return (await session.scalar(stmt)) or 0
+
+    @staticmethod
+    async def get_user_pending_deposits_count(session: AsyncSession, user_id: int) -> int:
+        """Подсчет неподтвержденных заявок на пополнение баланса"""
+        stmt = select(func.count(Transaction.id)).where(
+            Transaction.user_id == user_id,
+            Transaction.type == TransactionType.DEPOSIT,
+            Transaction.status == TransactionStatus.PENDING
+        )
+        return (await session.scalar(stmt)) or 0
+
+    @staticmethod
+    async def cleanup_expired_pending_orders(session: AsyncSession, max_age_seconds: int = 7200) -> int:
+        """Очистка брошенных неоплаченных заказов и их файлов на диске"""
+        from datetime import datetime, timezone, timedelta
+        from pathlib import Path
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
+        stmt = select(Order).where(
+            Order.status.in_([OrderStatus.PENDING_CONFIG, OrderStatus.PENDING_PAYMENT]),
+            Order.created_at < cutoff
+        )
+        result = await session.execute(stmt)
+        expired_orders = result.scalars().all()
+        cleaned_count = 0
+        for order in expired_orders:
+            # Удаляем файл с диска
+            try:
+                p = Path(order.file_path)
+                if p.exists() and p.is_file():
+                    p.unlink()
+            except Exception:
+                pass
+            order.status = OrderStatus.CANCELLED
+            order.error_message = "Истек срок ожидания оплаты (автоочистка)"
+            cleaned_count += 1
+
+        if cleaned_count > 0:
+            await session.commit()
+        return cleaned_count
+
+    @staticmethod
     async def get_setting(session: AsyncSession, key: str, default: str = "") -> str:
         s = await session.get(SystemSetting, key)
         return s.value if s else default
@@ -276,4 +328,5 @@ class Repository:
             s = SystemSetting(key=key, value=value)
             session.add(s)
         await session.commit()
+
 

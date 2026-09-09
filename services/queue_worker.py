@@ -42,16 +42,34 @@ class PrintQueueWorker:
         # Восстановление зависших заданий при аварийном рестарте
         await self._recover_hanging_jobs()
 
+        cleanup_counter = 0
         while self._is_running:
             try:
                 async with self._lock:
                     await self._process_next_job()
+
+                cleanup_counter += 1
+                if cleanup_counter >= 30:
+                    cleanup_counter = 0
+                    await self._cleanup_expired_jobs()
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in print queue worker loop: {e}", exc_info=True)
 
             await asyncio.sleep(2.0)
+
+    async def _cleanup_expired_jobs(self) -> None:
+        """Периодическая очистка брошенных неоплаченных заказов и файлов спула"""
+        try:
+            async with async_session_factory() as session:
+                max_age = settings.SPOOL_CLEANUP_HOURS * 3600
+                cleaned = await Repository.cleanup_expired_pending_orders(session, max_age_seconds=max_age)
+                if cleaned > 0:
+                    logger.info(f"Auto-cleaned {cleaned} expired abandoned orders and spool files.")
+        except Exception as e:
+            logger.error(f"Error cleaning expired spool files: {e}", exc_info=True)
 
     async def _recover_hanging_jobs(self) -> None:
         """Восстановление статусов заданий, которые прервались при перезапуске бота"""

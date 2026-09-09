@@ -75,8 +75,13 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
 
     # 3. Регистрация Middleware (безопасность, троттлинг и сессии БД)
-    dp.message.middleware(ThrottlingMiddleware(limit_seconds=settings.RATE_LIMIT_DELAY))
-    dp.callback_query.middleware(ThrottlingMiddleware(limit_seconds=settings.RATE_LIMIT_DELAY))
+    throttling = ThrottlingMiddleware(
+        limit_seconds=settings.RATE_LIMIT_DELAY,
+        burst_threshold=settings.RATE_LIMIT_BURST_COUNT,
+        block_duration=settings.RATE_LIMIT_BLOCK_SECONDS
+    )
+    dp.message.middleware(throttling)
+    dp.callback_query.middleware(throttling)
 
     dp.update.middleware(DbSessionMiddleware())
 

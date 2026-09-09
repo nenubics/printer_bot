@@ -3,6 +3,7 @@ import re
 import io
 import uuid
 import zipfile
+import shutil
 import logging
 from pathlib import Path
 from typing import Tuple, Set, List, Optional
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 # Защита от декомпрессионных бомб (OOM) в Pillow
 Image.MAX_IMAGE_PIXELS = 40_000_000
 MAX_ZIP_UNCOMPRESSED_BYTES = 50_000_000  # Максимум 50 МБ распакованного DOCX
+MAX_RECEIPT_SIZE_BYTES = 5 * 1024 * 1024  # Максимум 5 МБ для банковского чека
 
 # Допустимые сигнатуры (Magic Bytes)
 MAGIC_PDF = b"%PDF-"
@@ -67,6 +69,33 @@ class DocumentService:
         )
 
     @classmethod
+    def validate_receipt_file(cls, file_bytes: bytes, original_name: str = "") -> bool:
+        """
+        Строгая проверка банковского чека:
+        - Лимит размера не более 5 МБ
+        - Разрешены только изображения (JPEG, PNG, WebP) или PDF
+        - Запрещены любые бинарники, скрипты, HTML, архивы
+        """
+        if len(file_bytes) > MAX_RECEIPT_SIZE_BYTES:
+            raise DocumentSecurityError(
+                f"Чек слишком большой! Максимальный размер чека: {MAX_RECEIPT_SIZE_BYTES // (1024*1024)} МБ."
+            )
+        if len(file_bytes) < 32:
+            raise DocumentSecurityError("Файл чека поврежден или пуст.")
+
+        # Проверка по сигнатурам (Magic Bytes)
+        is_pdf = file_bytes.startswith(MAGIC_PDF)
+        is_png = file_bytes.startswith(MAGIC_PNG)
+        is_jpeg = file_bytes.startswith(MAGIC_JPEG)
+        is_webp = file_bytes.startswith(MAGIC_RIFF) and len(file_bytes) >= 12 and file_bytes[8:12] == b"WEBP"
+
+        if not (is_pdf or is_png or is_jpeg or is_webp):
+            raise DocumentSecurityError(
+                "Недопустимый формат чека! Разрешены только фотографии/сканы (JPG, PNG) или PDF-квитанции."
+            )
+        return True
+
+    @classmethod
     def process_and_save_upload(
         cls,
         file_bytes: bytes,
@@ -78,6 +107,17 @@ class DocumentService:
         сохраняет файл под безопасным UUID в папку спула и возвращает:
         (путь к файлу, общее количество страниц, очищенное имя)
         """
+        # 1. Защита дискового пространства от DoS переполнения
+        try:
+            free_mb = shutil.disk_usage(settings.DATA_DIR).free // (1024 * 1024)
+            if free_mb < settings.MIN_FREE_DISK_MB:
+                raise DocumentSecurityError(
+                    f"На сервере временно недостаточно места на диске ({free_mb} МБ свободно). "
+                    "Попробуйте позже или обратитесь к администратору."
+                )
+        except OSError as e:
+            logger.warning(f"Failed to check disk usage: {e}")
+
         if len(file_bytes) > settings.MAX_FILE_SIZE_BYTES:
             raise DocumentSecurityError(
                 f"Файл слишком большой! Максимальный размер: {settings.MAX_FILE_SIZE_BYTES // (1024*1024)} МБ."

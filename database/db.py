@@ -45,12 +45,24 @@ async_session_factory = async_sessionmaker(
 
 
 async def init_db() -> None:
-    """Инициализация базы данных: создание таблиц и дефолтных настроек"""
+    """Инициализация базы данных: создание таблиц и дефолтных настроек с защитой прав доступа (0700 / 0600)"""
+    import os
     settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
     settings.SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(settings.DATA_DIR, 0o700)
+        os.chmod(settings.SPOOL_DIR, 0o700)
+    except Exception:
+        pass
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    if settings.DB_PATH.exists():
+        try:
+            os.chmod(settings.DB_PATH, 0o600)
+        except Exception:
+            pass
 
     # Инициализация дефолтных настроек
     async with async_session_factory() as session:
