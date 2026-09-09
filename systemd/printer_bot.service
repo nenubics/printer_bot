@@ -1,0 +1,24 @@
+[Unit]
+Description=CSO-4 Pantum BP2300NW Telegram Print Bot
+After=network.target cups.service
+Wants=cups.service
+
+[Service]
+Type=simple
+User=artem
+WorkingDirectory=/Users/artem/Documents/printer_bot
+ExecStart=/Users/artem/Documents/printer_bot/venv/bin/python main.py
+Restart=always
+RestartSec=5s
+
+# Ограничения безопасности
+ProtectSystem=full
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Логирование через journald
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

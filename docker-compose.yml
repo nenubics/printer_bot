@@ -1,0 +1,26 @@
+version: "3.8"
+
+services:
+  printer_bot:
+    build: .
+    container_name: cso4_printer_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      # Монтирование сокета CUPS с хоста (если CUPS установлен на хосте Linux)
+      - /var/run/cups/cups.sock:/var/run/cups/cups.sock:ro
+    network_mode: host # host-сеть для прямого доступа к сетевому принтеру Pantum в ЦСО-4
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "python", "scripts/healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
