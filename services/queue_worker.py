@@ -103,18 +103,36 @@ class PrintQueueWorker:
 
         logger.info(f"Started printing job {order_uuid} (copies={copies}, pages={selected_pages})")
 
-        # 3. Выполняем печать
-        success, message, job_id = await PrinterService.print_job(
-            pdf_path=file_path,
-            copies=copies,
-            selected_pages=selected_pages,
-            title=f"Order_{order_uuid[:8]}"
-        )
+        # 3. Физическая нарезка и подготовка страниц (вырезаем только выбранные страницы)
+        prepared_pdf_path = file_path
+        try:
+            prepared_pdf_path = DocumentService.prepare_job_pdf(
+                source_pdf=file_path,
+                order_uuid=order_uuid,
+                selected_pages=selected_pages,
+                copies=copies if settings.PRINTER_MODE.lower() == "raw" else 1
+            )
+        except Exception as prep_err:
+            logger.error(f"Failed to prepare/slice PDF for order {order_uuid}: {prep_err}", exc_info=True)
+            prepared_pdf_path = file_path
+
+        try:
+            # 4. Выполняем печать подготовленного файла
+            success, message, job_id = await PrinterService.print_job(
+                pdf_path=prepared_pdf_path,
+                copies=copies if settings.PRINTER_MODE.lower() != "raw" else 1,
+                selected_pages="all",  # В prepared_pdf_path страницы уже физически нарезаны!
+                title=f"Order_{order_uuid[:8]}"
+            )
+        finally:
+            # Если создавался отдельный временный нарезанный файл, удаляем его
+            if prepared_pdf_path != file_path:
+                DocumentService.cleanup_file(str(prepared_pdf_path))
 
         async with async_session_factory() as session:
             if success:
                 await Repository.update_order_status(session, order_id, OrderStatus.COMPLETED)
-                # Безопасно удаляем файл с диска
+                # Безопасно удаляем исходный файл с диска
                 DocumentService.cleanup_file(str(file_path))
 
                 # Учет расхода бумаги в лотке Pantum BP2300NW

@@ -180,6 +180,18 @@ async def process_custom_pages(message: Message, state: FSMContext, session: Asy
         await message.answer(f"❌ {str(e)}\n\nПопробуйте еще раз (например: <code>1-3, 5</code>):", parse_mode="HTML")
         return
 
+    # Контроль вместимости лотка принтера Pantum BP2300NW
+    total_sheets = pages_count * order.copies
+    if total_sheets > settings.MAX_SHEETS_PER_ORDER:
+        await message.answer(
+            f"❌ <b>Превышена вместимость лотка бумаги!</b>\n\n"
+            f"Выбрано: <b>{pages_count} стр.</b> x <b>{order.copies} экз.</b> = <b>{total_sheets} листов</b>.\n"
+            f"Лоток принтера Pantum BP2300NW вмещает не более <b>{settings.MAX_SHEETS_PER_ORDER} листов</b>.\n\n"
+            f"Пожалуйста, укажите меньший диапазон страниц (например: <code>1-{min(total_pages, settings.MAX_SHEETS_PER_ORDER)}</code>):",
+            parse_mode="HTML"
+        )
+        return
+
     price_str = await Repository.get_setting(session, "price_per_page", str(settings.PRICE_PER_PAGE_RUB))
     price_per_page = float(price_str)
     cost = round(pages_count * order.copies * price_per_page, 2)
@@ -197,6 +209,7 @@ async def process_custom_pages(message: Message, state: FSMContext, session: Asy
         f"📑 Всего в файле: <b>{order.total_pages}</b> стр.\n"
         f"🖨 К печати: <b>{display_pages}</b> ({pages_count} стр.)\n"
         f"🔢 Количество копий: <b>{order.copies}</b>\n"
+        f"📑 Суммарно листов: <b>{total_sheets}</b>\n"
         f"💵 Стоимость: <b>{cost:.2f} ₽</b>\n"
     )
 
@@ -234,6 +247,22 @@ async def cb_set_copies(callback: CallbackQuery, session: AsyncSession):
         await callback.answer("Заказ не найден.", show_alert=True)
         return
 
+    # Проверка лимитов на копии и лоток
+    if copies < 1 or copies > settings.MAX_COPIES_PER_JOB:
+        await callback.answer(
+            f"Количество копий должно быть от 1 до {settings.MAX_COPIES_PER_JOB}.",
+            show_alert=True
+        )
+        return
+
+    total_sheets = order.pages_to_print_count * copies
+    if total_sheets > settings.MAX_SHEETS_PER_ORDER:
+        await callback.answer(
+            f"Слишком много листов ({total_sheets}). Лоток Pantum вмещает не более {settings.MAX_SHEETS_PER_ORDER} листов.",
+            show_alert=True
+        )
+        return
+
     price_str = await Repository.get_setting(session, "price_per_page", str(settings.PRICE_PER_PAGE_RUB))
     price_per_page = float(price_str)
     cost = round(order.pages_to_print_count * copies * price_per_page, 2)
@@ -249,6 +278,7 @@ async def cb_set_copies(callback: CallbackQuery, session: AsyncSession):
         f"📑 Всего в файле: <b>{order.total_pages}</b> стр.\n"
         f"🖨 К печати: <b>{display_pages}</b> ({order.pages_to_print_count} стр.)\n"
         f"🔢 Количество копий: <b>{copies}</b>\n"
+        f"📑 Суммарно листов: <b>{total_sheets}</b>\n"
         f"💵 Итого к оплате: <b>{cost:.2f} ₽</b>\n"
     )
     await callback.message.edit_text(
@@ -301,6 +331,16 @@ async def cb_pay_order(callback: CallbackQuery, session: AsyncSession):
     order = await Repository.get_order_by_uuid(session, order_uuid)
     if not order or order.status not in (OrderStatus.PENDING_CONFIG, OrderStatus.PENDING_PAYMENT):
         await callback.answer("Заказ недоступен для оплаты.", show_alert=True)
+        return
+
+    # Проверка емкости лотка перед переходом к оплате
+    total_sheets = order.pages_to_print_count * order.copies
+    if total_sheets > settings.MAX_SHEETS_PER_ORDER:
+        await callback.answer(
+            f"В заказе {total_sheets} листов. Лоток принтера Pantum вмещает не более {settings.MAX_SHEETS_PER_ORDER} листов. "
+            f"Пожалуйста, выберите меньший диапазон страниц.",
+            show_alert=True
+        )
         return
 
     user = await Repository.get_or_create_user(session, callback.from_user.id)

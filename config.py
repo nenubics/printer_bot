@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     # Printing & Limits (Security / Hardware Protection)
     MAX_FILE_SIZE_BYTES: int = Field(default=35 * 1024 * 1024, description="Максимальный размер файла (35 МБ)")
     MAX_PAGES_PER_JOB: int = Field(default=200, description="Максимальное количество страниц за одну печать")
+    MAX_COPIES_PER_JOB: int = Field(default=20, description="Максимальное количество копий за один заказ")
+    MAX_SHEETS_PER_ORDER: int = Field(default=150, description="Максимальное число листов в заказе (емкость лотка Pantum BP2300NW)")
+    PAGE_FIT_A4: bool = Field(default=True, description="Автоматическое масштабирование страниц под формат A4")
     PRICE_PER_PAGE_RUB: float = Field(default=5.0, description="Базовая цена за страницу (руб)")
     
     # Printer Settings (Pantum BP2300NW)

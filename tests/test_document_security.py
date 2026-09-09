@@ -130,15 +130,26 @@ class TestDocumentSecurity(unittest.TestCase):
         self.assertGreater(len(qr_bytes), 500)
 
     def test_docx_handling(self):
-        # Fake docx starts with ZIP magic bytes
-        fake_docx = b"PK\x03\x04\x14\x00\x00\x00\x08\x00"
-        file_type = DocumentService.detect_file_type(fake_docx, filename="essay.docx")
+        # Corrupt docx with broken zip structure is rejected
+        broken_docx = b"PK\x03\x04\x14\x00\x00\x00\x08\x00"
+        file_type = DocumentService.detect_file_type(broken_docx, filename="essay.docx")
         self.assertEqual(file_type, "docx")
 
-        # Without libreoffice installed, it raises DocumentSecurityError explaining to export as PDF
-        with self.assertRaises(DocumentSecurityError) as ctx:
-            DocumentService.process_and_save_upload(fake_docx, "essay.docx", "uuid-docx")
-        self.assertIn("PDF", str(ctx.exception))
+        with self.assertRaises(DocumentSecurityError):
+            DocumentService.process_and_save_upload(broken_docx, "essay.docx", "uuid-docx-broken")
+
+        # Valid docx is processed via pure-python fallback / soffice into A4 PDF
+        import docx
+        doc = docx.Document()
+        doc.add_paragraph("Тестовое эссе для студента ЦСО-4.")
+        buf = io.BytesIO()
+        doc.save(buf)
+        valid_docx = buf.getvalue()
+
+        dest_pdf, pages, name = DocumentService.process_and_save_upload(valid_docx, "essay.docx", "uuid-docx-valid")
+        self.assertGreaterEqual(pages, 1)
+        self.assertTrue(dest_pdf.exists())
+        self.assertTrue(str(dest_pdf).endswith(".pdf"))
 
 
 if __name__ == "__main__":
