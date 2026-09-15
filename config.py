@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union, Any
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     # Telegram Bot
     BOT_TOKEN: str = Field(default="YOUR_BOT_TOKEN_HERE", description="Токен Telegram бота от @BotFather")
-    ADMIN_IDS: List[int] = Field(default_factory=list, description="Список Telegram ID администраторов")
+    ADMIN_IDS: Union[List[int], str, Any] = Field(default_factory=list, description="Список Telegram ID администраторов")
 
     # Storage & Paths
     DATA_DIR: Path = Field(default=Path("data"), description="Папка для хранения данных")
@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     MAX_COPIES_PER_JOB: int = Field(default=20, description="Максимальное количество копий за один заказ")
     MAX_SHEETS_PER_ORDER: int = Field(default=150, description="Максимальное число листов в заказе (емкость лотка Pantum BP2300NW)")
     PAGE_FIT_A4: bool = Field(default=True, description="Автоматическое масштабирование страниц под формат A4")
+    AUTO_SKIP_BLANK_PAGES: bool = Field(default=True, description="Автоматически пропускать пустые страницы в документах для экономии бумаги")
+    ENHANCE_CONTRAST_PHOTOS: bool = Field(default=True, description="Интеллектуальное отбеливание серого фона на фото/сканах для экономии тонера")
+    TONER_SAVE_MODE: bool = Field(default=False, description="Режим экономии тонера (draft)")
     PRICE_PER_PAGE_RUB: float = Field(default=5.0, description="Базовая цена за страницу (руб)")
     
     # Printer Settings (Pantum BP2300NW)

@@ -22,6 +22,8 @@ data/spool/*
 !data/spool/.gitkeep
 data/receipts/*
 !data/receipts/.gitkeep
+data/test/*
+data/logs/*
 
 # System & IDE files
 .DS_Store

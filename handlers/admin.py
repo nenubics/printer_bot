@@ -10,6 +10,7 @@ from config import settings
 from database.models import User, Order, Transaction, OrderStatus, TransactionType, TransactionStatus
 from database.repo import Repository
 from services.printer import PrinterService
+from services.queue_worker import notify_worker_new_job
 from handlers.states import AdminState
 from handlers.keyboards import get_admin_panel_keyboard
 
@@ -120,6 +121,14 @@ async def cb_admin_approve_sbp(callback: CallbackQuery, bot: Bot, session: Async
         await callback.answer("Заказ уже обработан другим администратором.", show_alert=True)
         return
 
+    # Защита от race condition между несколькими админами: атомарный CAS перевод в QUEUED
+    swapped = await Repository.transition_order_status_atomic(
+        session, order.id, OrderStatus.PENDING_ADMIN_APPROVAL, OrderStatus.QUEUED
+    )
+    if not swapped:
+        await callback.answer("Заказ уже обработан другим администратором.", show_alert=True)
+        return
+
     user_id = order.user_id
     amount = order.cost_rub
 
@@ -141,8 +150,8 @@ async def cb_admin_approve_sbp(callback: CallbackQuery, bot: Bot, session: Async
         order_id=order.id
     )
 
-    # Переводим заказ в очередь печати
-    await Repository.update_order_status(session, order.id, OrderStatus.QUEUED)
+    # Мгновенно пробуждаем спулер печати (< 10 мс)
+    notify_worker_new_job()
 
     # Обновляем сообщение у админа
     admin_name = callback.from_user.first_name

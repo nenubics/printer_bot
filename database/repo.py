@@ -185,6 +185,36 @@ class Repository:
         return order
 
     @staticmethod
+    async def transition_order_status_atomic(
+        session: AsyncSession,
+        order_id: int,
+        from_status: OrderStatus,
+        to_status: OrderStatus,
+        error_message: Optional[str] = None
+    ) -> bool:
+        """
+        Атомарный CAS (Compare-And-Swap) переход статуса заказа.
+        Возвращает True только если заказ действительно находился в статусе from_status.
+        Исключает race condition при параллельных запросах (защита от повторной оплаты).
+        """
+        values = {"status": to_status}
+        if error_message:
+            values["error_message"] = error_message
+        if to_status == OrderStatus.COMPLETED:
+            values["printed_at"] = utc_now()
+
+        stmt = (
+            update(Order)
+            .where(Order.id == order_id, Order.status == from_status)
+            .values(**values)
+            .returning(Order.id)
+        )
+        result = await session.execute(stmt)
+        updated_id = result.scalar_one_or_none()
+        await session.commit()
+        return updated_id is not None
+
+    @staticmethod
     async def get_next_queued_order(session: AsyncSession) -> Optional[Order]:
         """Получить следующий заказ из очереди печати"""
         stmt = select(Order).where(
@@ -195,9 +225,9 @@ class Repository:
 
     @staticmethod
     async def get_queued_orders_count(session: AsyncSession) -> int:
-        stmt = select(Order).where(Order.status.in_([OrderStatus.QUEUED, OrderStatus.PRINTING]))
-        result = await session.execute(stmt)
-        return len(result.scalars().all())
+        """Быстрый подсчет заказов в очереди без загрузки полных объектов в память"""
+        stmt = select(func.count(Order.id)).where(Order.status.in_([OrderStatus.QUEUED, OrderStatus.PRINTING]))
+        return (await session.scalar(stmt)) or 0
 
     @staticmethod
     async def get_queued_orders(session: AsyncSession) -> List[Order]:

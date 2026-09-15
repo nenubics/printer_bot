@@ -14,12 +14,28 @@ from services.printer import PrinterService
 logger = logging.getLogger(__name__)
 
 
+_global_worker: Optional["PrintQueueWorker"] = None
+
+
+def notify_worker_new_job() -> None:
+    """Глобальный триггер для мгновенного пробуждения спулера печати (< 10 мс)"""
+    if _global_worker:
+        _global_worker.notify_new_job()
+
+
 class PrintQueueWorker:
     def __init__(self, bot: Bot):
+        global _global_worker
         self.bot = bot
         self._is_running = False
         self._task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
+        self._new_job_event = asyncio.Event()
+        _global_worker = self
+
+    def notify_new_job(self) -> None:
+        """Мгновенное пробуждение воркера при поступлении или подтверждении заказа"""
+        self._new_job_event.set()
 
     def start(self) -> None:
         if not self._is_running:
@@ -38,7 +54,7 @@ class PrintQueueWorker:
             logger.info("Print Queue Worker stopped.")
 
     async def _worker_loop(self) -> None:
-        """Бесконечный цикл обработки очереди печати с авто-восстановлением"""
+        """Бесконечный событийный цикл обработки очереди печати с авто-восстановлением"""
         # Восстановление зависших заданий при аварийном рестарте
         await self._recover_hanging_jobs()
 
@@ -58,7 +74,12 @@ class PrintQueueWorker:
             except Exception as e:
                 logger.error(f"Error in print queue worker loop: {e}", exc_info=True)
 
-            await asyncio.sleep(2.0)
+            # Событийное ожидание: пробуждается мгновенно по сигналу или раз в 2 секунды
+            try:
+                await asyncio.wait_for(self._new_job_event.wait(), timeout=2.0)
+                self._new_job_event.clear()
+            except asyncio.TimeoutError:
+                pass
 
     async def _cleanup_expired_jobs(self) -> None:
         """Периодическая очистка брошенных неоплаченных заказов и файлов спула"""

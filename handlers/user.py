@@ -12,6 +12,7 @@ from config import settings
 from database.models import OrderStatus, TransactionType
 from database.repo import Repository
 from services.document import DocumentService, DocumentSecurityError
+from services.queue_worker import notify_worker_new_job
 from handlers.states import OrderConfigState, PaymentState
 from handlers.keyboards import (
     get_order_config_keyboard,
@@ -114,10 +115,24 @@ async def handle_document_upload(message: Message, bot: Bot, session: AsyncSessi
         )
         return
 
+    # Проверка на наличие пустых страниц для экономии бумаги и средств
+    non_blank_pages, blank_pages = DocumentService.get_non_blank_pages(dest_path)
+    pages_to_print = total_pages
+    blank_notice = ""
+    selected_pages_val = "all"
+
+    if settings.AUTO_SKIP_BLANK_PAGES and blank_pages and non_blank_pages:
+        pages_to_print = len(non_blank_pages)
+        selected_pages_val = ", ".join(str(p) for p in non_blank_pages)
+        blank_notice = (
+            f"🌱 <i>Обнаружено пустых страниц: <b>{len(blank_pages)}</b> "
+            f"(автоматически исключены для экономии бумаги).</i>\n\n"
+        )
+
     # Получаем тариф за страницу
     price_str = await Repository.get_setting(session, "price_per_page", str(settings.PRICE_PER_PAGE_RUB))
     price_per_page = float(price_str)
-    cost = round(total_pages * price_per_page, 2)
+    cost = round(pages_to_print * price_per_page, 2)
 
     # Создаем заказ в БД
     order = await Repository.create_order(
@@ -127,17 +142,19 @@ async def handle_document_upload(message: Message, bot: Bot, session: AsyncSessi
         file_path=str(dest_path),
         file_size=file_size,
         total_pages=total_pages,
-        pages_to_print_count=total_pages,
+        pages_to_print_count=pages_to_print,
         cost_rub=cost,
-        selected_pages="all",
+        selected_pages=selected_pages_val,
         copies=1
     )
 
+    display_pages_str = "Все" if selected_pages_val == "all" else selected_pages_val
     card_text = (
         f"📄 <b>Документ готов к печати!</b>\n\n"
         f"📎 Файл: <code>{sanitized_name}</code>\n"
-        f"📑 Всего страниц: <b>{total_pages}</b>\n"
-        f"🖨 Будет напечатано: <b>Все ({total_pages} стр.)</b>\n"
+        f"📑 Всего в файле: <b>{total_pages}</b> стр.\n"
+        f"{blank_notice}"
+        f"🖨 Будет напечатано: <b>{display_pages_str} ({pages_to_print} стр.)</b>\n"
         f"🔢 Количество копий: <b>1</b>\n"
         f"💵 Стоимость: <b>{cost:.2f} ₽</b> ({price_per_page:.2f} ₽/стр)\n\n"
         f"<i>Вы можете настроить диапазон страниц или сразу перейти к оплате:</i>"
@@ -145,7 +162,7 @@ async def handle_document_upload(message: Message, bot: Bot, session: AsyncSessi
 
     await status_msg.edit_text(
         card_text,
-        reply_markup=get_order_config_keyboard(order.order_uuid, copies=1, pages_str="Все"),
+        reply_markup=get_order_config_keyboard(order.order_uuid, copies=1, pages_str=display_pages_str),
         parse_mode="HTML"
     )
 
@@ -384,6 +401,14 @@ async def cb_pay_balance(callback: CallbackQuery, session: AsyncSession):
         await callback.answer("Заказ уже оплачен или недоступен.", show_alert=True)
         return
 
+    # Защита от double-spend: атомарный CAS переход статуса заказа в QUEUED
+    swapped = await Repository.transition_order_status_atomic(
+        session, order.id, OrderStatus.PENDING_PAYMENT, OrderStatus.QUEUED
+    )
+    if not swapped:
+        await callback.answer("Заказ уже обрабатывается или оплачен.", show_alert=True)
+        return
+
     # Атомарное списание с проверкой
     success, new_balance, msg = await Repository.update_balance(
         session=session,
@@ -395,11 +420,15 @@ async def cb_pay_balance(callback: CallbackQuery, session: AsyncSession):
     )
 
     if not success:
+        # Откатываем статус обратно при нехватке средств
+        await Repository.transition_order_status_atomic(
+            session, order.id, OrderStatus.QUEUED, OrderStatus.PENDING_PAYMENT
+        )
         await callback.answer(f"❌ Ошибка оплаты: {msg}", show_alert=True)
         return
 
-    # Заказ переведен в очередь
-    await Repository.update_order_status(session, order.id, OrderStatus.QUEUED)
+    # Мгновенно пробуждаем спулер печати (< 10 мс)
+    notify_worker_new_job()
 
     queued_count = await Repository.get_queued_orders_count(session)
 
@@ -582,12 +611,19 @@ async def process_successful_payment(message: Message, session: AsyncSession):
         order_uuid = payload.split(":")[1]
         order = await Repository.get_order_by_uuid(session, order_uuid)
         if order and order.status == OrderStatus.PENDING_PAYMENT:
+            # Атомарный перевод в очередь
+            swapped = await Repository.transition_order_status_atomic(
+                session, order.id, OrderStatus.PENDING_PAYMENT, OrderStatus.QUEUED
+            )
+            if not swapped:
+                return
+
             # Зачисляем транзакцию
             await Repository.update_balance(
                 session=session,
                 user_id=order.user_id,
                 delta=order.cost_rub,
-                trans_type=TransactionType.TOPUP_TELEGRAM_STARS,
+                trans_type=TransactionType.DEPOSIT,
                 payment_method="stars",
                 order_id=order.id
             )
@@ -600,8 +636,10 @@ async def process_successful_payment(message: Message, session: AsyncSession):
                 payment_method="stars",
                 order_id=order.id
             )
-            # Ставим в очередь
-            await Repository.update_order_status(session, order.id, OrderStatus.QUEUED)
+
+            # Мгновенно пробуждаем спулер печати (< 10 мс)
+            notify_worker_new_job()
+
             await message.answer(
                 f"🌟 <b>Оплата Telegram Stars подтверждена!</b>\n\n"
                 f"Заказ #{order.id} отправлен в очередь на принтер Pantum BP2300NW.",

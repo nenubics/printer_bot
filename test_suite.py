@@ -4,7 +4,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageDraw
 import pypdf
 
 from config import settings
@@ -265,30 +265,120 @@ class TestDatabaseAndBalance(unittest.IsolatedAsyncioTestCase):
 
 class TestPrinterService(unittest.IsolatedAsyncioTestCase):
     async def test_mock_status_and_print(self):
-        status = await PrinterService.check_status()
-        self.assertTrue(status["is_ready"])
-        self.assertIn("mock", status["state"])
+        orig_mode = settings.PRINTER_MODE
+        settings.PRINTER_MODE = "mock"
+        try:
+            status = await PrinterService.check_status()
+            self.assertTrue(status["is_ready"])
+            self.assertIn("mock", status["state"])
 
+            temp_dir = Path(tempfile.mkdtemp())
+            try:
+                dummy_pdf = temp_dir / "print_test.pdf"
+                dummy_pdf.write_bytes(create_dummy_pdf(1))
+
+                success, msg, job_id = await PrinterService.print_job(
+                    pdf_path=dummy_pdf,
+                    copies=1,
+                    selected_pages="1",
+                    title="TestPrint"
+                )
+                self.assertTrue(success)
+                self.assertIsNotNone(job_id)
+
+                # Test missing file error handling
+                missing_pdf = temp_dir / "nonexistent.pdf"
+                success, msg, job_id = await PrinterService.print_job(pdf_path=missing_pdf)
+                self.assertFalse(success)
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        finally:
+            settings.PRINTER_MODE = orig_mode
+
+
+class TestEcoAndPerformanceOptimizations(unittest.IsolatedAsyncioTestCase):
+    def test_document_image_enhancement(self):
+        # Тест отбеливания фона (серый фон -> 255, темный текст -> 0)
+        img = Image.new("L", (100, 100), color=215) # Серый фон мобильного фото
+        # Рисуем темный символ
+        for y in range(40, 60):
+            for x in range(40, 60):
+                img.putpixel((x, y), 50)
+
+        enhanced = DocumentService.enhance_document_image(img)
+        # Фон должен стать идеально белым (экономия тонера)
+        self.assertEqual(enhanced.getpixel((10, 10)), 255)
+        # Текст должен стать глубоким черным
+        self.assertEqual(enhanced.getpixel((50, 50)), 0)
+
+    def test_blank_page_detection(self):
         temp_dir = Path(tempfile.mkdtemp())
         try:
-            dummy_pdf = temp_dir / "print_test.pdf"
-            dummy_pdf.write_bytes(create_dummy_pdf(1))
+            pdf_path = temp_dir / "test_blank.pdf"
+            writer = pypdf.PdfWriter()
+            # 1. Страница с текстом
+            text_img = Image.new("L", (595, 842), 255)
+            draw = ImageDraw.Draw(text_img)
+            draw.text((100, 100), "Hello Student", fill=0)
+            buf1 = io.BytesIO()
+            text_img.save(buf1, "PDF")
+            buf1.seek(0)
+            writer.add_page(pypdf.PdfReader(buf1).pages[0])
 
-            success, msg, job_id = await PrinterService.print_job(
-                pdf_path=dummy_pdf,
-                copies=1,
-                selected_pages="1",
-                title="TestPrint"
-            )
-            self.assertTrue(success)
-            self.assertIsNotNone(job_id)
+            # 2. Полностью пустая страница
+            writer.add_blank_page(width=595, height=842)
 
-            # Test missing file error handling
-            missing_pdf = temp_dir / "nonexistent.pdf"
-            success, msg, job_id = await PrinterService.print_job(pdf_path=missing_pdf)
-            self.assertFalse(success)
+            with open(str(pdf_path), "wb") as f:
+                writer.write(f)
+
+            non_blank, blank = DocumentService.get_non_blank_pages(pdf_path)
+            self.assertEqual(non_blank, [1])
+            self.assertEqual(blank, [2])
+
+            # Проверка, что prepare_job_pdf пропускает пустую страницу при AUTO_SKIP_BLANK_PAGES
+            prepared = DocumentService.prepare_job_pdf(pdf_path, "test_order", "all", copies=1)
+            prep_reader = pypdf.PdfReader(str(prepared))
+            self.assertEqual(len(prep_reader.pages), 1)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+    async def test_atomic_cas_transition(self):
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        session_maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with session_maker() as session:
+            user = User(id=777, username="student_test", full_name="Student Test", balance=100.0)
+            session.add(user)
+            await session.commit()
+
+            order = await Repository.create_order(
+                session=session,
+                user_id=777,
+                original_filename="doc.pdf",
+                file_path="/tmp/doc.pdf",
+                file_size=1024,
+                total_pages=2,
+                pages_to_print_count=2,
+                cost_rub=10.0
+            )
+            order.status = OrderStatus.PENDING_PAYMENT
+            await session.commit()
+
+            # Первая попытка CAS (успех)
+            ok1 = await Repository.transition_order_status_atomic(
+                session, order.id, OrderStatus.PENDING_PAYMENT, OrderStatus.QUEUED
+            )
+            self.assertTrue(ok1)
+
+            # Вторая попытка CAS от того же статуса (должна вернуть False - защита от race condition)
+            ok2 = await Repository.transition_order_status_atomic(
+                session, order.id, OrderStatus.PENDING_PAYMENT, OrderStatus.QUEUED
+            )
+            self.assertFalse(ok2)
+
+        await engine.dispose()
 
 
 if __name__ == "__main__":

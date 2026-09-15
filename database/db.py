@@ -34,6 +34,9 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor.execute("PRAGMA synchronous = NORMAL;")
     cursor.execute("PRAGMA foreign_keys = ON;")
     cursor.execute("PRAGMA busy_timeout = 10000;")
+    cursor.execute("PRAGMA cache_size = -64000;")    # 64 MB памяти под кэш страниц
+    cursor.execute("PRAGMA mmap_size = 268435456;")  # 256 MB memory-mapped I/O
+    cursor.execute("PRAGMA temp_store = MEMORY;")    # Временные таблицы и сортировки в RAM
     cursor.close()
 
 

@@ -21,6 +21,7 @@ class ThrottlingMiddleware(BaseMiddleware):
         self.user_timestamps: Dict[int, float] = {}
         self.violation_counts: Dict[int, int] = {}
         self.banned_until: Dict[int, float] = {}
+        self._last_cleanup: float = time.monotonic()
         super().__init__()
 
     async def __call__(
@@ -37,6 +38,14 @@ class ThrottlingMiddleware(BaseMiddleware):
 
         if user_id:
             now = time.monotonic()
+
+            # Периодическая очистка устаревших записей (защита от утечки RAM)
+            if now - self._last_cleanup > 60.0:
+                self._last_cleanup = now
+                cutoff = now - 300.0
+                self.user_timestamps = {uid: t for uid, t in self.user_timestamps.items() if t > cutoff}
+                self.violation_counts = {uid: c for uid, c in self.violation_counts.items() if uid in self.user_timestamps}
+                self.banned_until = {uid: t for uid, t in self.banned_until.items() if t > now}
 
             # 1. Проверяем, находится ли пользователь во временном бане за флуд
             ban_expiry = self.banned_until.get(user_id, 0.0)

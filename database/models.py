@@ -77,7 +77,7 @@ class Order(Base):
     )
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
     printed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     user: Mapped["User"] = relationship("User", back_populates="orders")
@@ -99,7 +99,7 @@ class Transaction(Base):
     provider_payment_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
     proof_file_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True) # file_id скриншота чека
     
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
 
     user: Mapped["User"] = relationship("User", back_populates="transactions")
     order: Mapped[Optional["Order"]] = relationship("Order", back_populates="transactions")

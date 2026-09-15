@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import re
 import socket
+import time
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Any
 from config import settings
@@ -9,32 +11,43 @@ logger = logging.getLogger(__name__)
 
 
 class PrinterService:
+    _cached_status: Optional[Dict[str, Any]] = None
+    _cached_status_time: float = 0.0
+    _cache_ttl: float = 3.0
+
     @classmethod
-    async def check_status(cls) -> Dict[str, Any]:
+    async def check_status(cls, force_refresh: bool = False) -> Dict[str, Any]:
         """
         Проверка состояния принтера Pantum BP2300NW.
+        Снабжена TTL-кэшированием (3.0 сек) для предотвращения спама подпроцессами lpstat.
         Возвращает словарь: {'is_ready': bool, 'state': str, 'message': str}
         """
+        now = time.monotonic()
+        if not force_refresh and cls._cached_status is not None and (now - cls._cached_status_time < cls._cache_ttl):
+            return cls._cached_status
+
         mode = settings.PRINTER_MODE.lower()
 
         if mode == "mock":
-            return {
+            res = {
                 "is_ready": True,
                 "state": "ready (mock)",
                 "message": "Принтер в режиме симуляции (готов к тестам)."
             }
-
         elif mode == "cups":
-            return await cls._check_cups_status()
-
+            res = await cls._check_cups_status()
         elif mode == "raw":
-            return await cls._check_raw_status()
+            res = await cls._check_raw_status()
+        else:
+            res = {
+                "is_ready": False,
+                "state": "unknown_mode",
+                "message": f"Неизвестный режим принтера: {mode}"
+            }
 
-        return {
-            "is_ready": False,
-            "state": "unknown_mode",
-            "message": f"Неизвестный режим принтера: {mode}"
-        }
+        cls._cached_status = res
+        cls._cached_status_time = now
+        return res
 
     @classmethod
     async def _check_cups_status(cls) -> Dict[str, Any]:
@@ -106,12 +119,12 @@ class PrinterService:
             }
 
         loop = asyncio.get_running_loop()
+        sock = None
         try:
-            # Пробуем подключиться к порту с таймаутом 2 секунды
+            # Пробуем подключиться к порту с таймаутом 2.5 секунды
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setblocking(False)
             await asyncio.wait_for(loop.sock_connect(sock, (host, port)), timeout=2.5)
-            sock.close()
             return {
                 "is_ready": True,
                 "state": "online",
@@ -123,6 +136,12 @@ class PrinterService:
                 "state": "offline",
                 "message": f"Принтер {host}:{port} недоступен в сети: {e}"
             }
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
     @classmethod
     async def print_job(
@@ -165,21 +184,27 @@ class PrinterService:
         selected_pages: str,
         title: str
     ) -> Tuple[bool, str, Optional[str]]:
-        """Печать через системную очередь CUPS с безопасными параметрами"""
-        printer = settings.PRINTER_NAME
+        safe_title = re.sub(r'[^a-zA-Z0-9_\-]', '_', title)[:32] or "PrintJob"
         args = [
             "lp",
             "-d", printer,
             "-n", str(copies),
-            "-t", title[:32], # безопасный заголовок
+            "-t", safe_title,
             "-o", "media=A4",
             "-o", "fit-to-page",
+            "-o", "print-color-mode=monochrome",
+            "-o", "ColorModel=Gray",
+            "-o", "print-content-optimize=text",
         ]
+
+        if getattr(settings, "TONER_SAVE_MODE", False):
+            args.extend(["-o", "cupsPrintQuality=Draft"])
 
         if selected_pages and selected_pages.lower() not in ("all", "все", "*"):
             args.extend(["-o", f"page-ranges={selected_pages}"])
 
         args.append(str(pdf_path.resolve()))
+        cls._cached_status = None  # Сброс кэша статуса при новом задании
 
         try:
             logger.info(f"Executing CUPS command: {' '.join(args[:-1])} <file>")
