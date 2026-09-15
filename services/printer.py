@@ -234,14 +234,17 @@ class PrinterService:
 
     @classmethod
     async def _print_raw(cls, pdf_path: Path) -> Tuple[bool, str, Optional[str]]:
-        """Отправка байтов напрямую в сетевой сокет принтера (Port 9100)"""
+        """
+        Потоковая отправка байтов напрямую в сетевой сокет принтера (Port 9100 JetDirect):
+        - Чанковая потоковая передача блоками по 64 КБ: не загружает весь файл в память роутера.
+        - Быстрая проверка живости сокета перед передачей.
+        """
         host = settings.PRINTER_HOST
         port = settings.PRINTER_PORT
         if not host:
             return False, "Не задан PRINTER_HOST для прямого сокета.", None
 
         try:
-            file_data = pdf_path.read_bytes()
             reader, writer = await asyncio.open_connection(host, port)
 
             # Проверяем, не разорвал ли принтер соединение сразу
@@ -255,12 +258,15 @@ class PrinterService:
                 # Таймаут ожидаем: сетевой принтер слушает порт и не шлет данные первым
                 pass
 
-            writer.write(file_data)
-            await writer.drain()
+            # Потоковая отправка блоками по 64 КБ для защиты RAM роутера
+            with open(str(pdf_path), "rb") as f:
+                while chunk := f.read(65536):
+                    writer.write(chunk)
+                    await writer.drain()
 
             writer.close()
             await writer.wait_closed()
-            return True, f"Файл отправлен на сетевой порт {host}:{port}", "RAW-SOCKET-JOB"
+            return True, f"Файл успешно передан на сетевой порт {host}:{port}", "RAW-SOCKET-JOB"
         except Exception as e:
             logger.error(f"Raw socket print failed: {e}", exc_info=True)
             return False, f"Сбой отправки на сокет принтера: {e}", None

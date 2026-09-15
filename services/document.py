@@ -1,4 +1,5 @@
 import os
+import gc
 import re
 import io
 import uuid
@@ -13,8 +14,8 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
-# Защита от декомпрессионных бомб (OOM) в Pillow
-Image.MAX_IMAGE_PIXELS = 40_000_000
+# Защита от декомпрессионных бомб (OOM) в Pillow с учетом доступной памяти
+Image.MAX_IMAGE_PIXELS = 15_000_000 if settings.is_low_memory else 40_000_000
 MAX_ZIP_UNCOMPRESSED_BYTES = 50_000_000  # Максимум 50 МБ распакованного DOCX
 MAX_RECEIPT_SIZE_BYTES = 5 * 1024 * 1024  # Максимум 5 МБ для банковского чека
 
@@ -109,8 +110,10 @@ class DocumentService:
         """
         # 1. Защита дискового пространства от DoS переполнения
         try:
-            free_mb = shutil.disk_usage(settings.DATA_DIR).free // (1024 * 1024)
-            if free_mb < settings.MIN_FREE_DISK_MB:
+            spool_target = settings.effective_spool_dir
+            check_dir = spool_target if spool_target.exists() else settings.DATA_DIR
+            free_mb = shutil.disk_usage(check_dir).free // (1024 * 1024)
+            if free_mb < settings.effective_min_free_disk_mb:
                 raise DocumentSecurityError(
                     f"На сервере временно недостаточно места на диске ({free_mb} МБ свободно). "
                     "Попробуйте позже или обратитесь к администратору."
@@ -118,17 +121,18 @@ class DocumentService:
         except OSError as e:
             logger.warning(f"Failed to check disk usage: {e}")
 
-        if len(file_bytes) > settings.MAX_FILE_SIZE_BYTES:
+        if len(file_bytes) > settings.effective_max_file_size:
             raise DocumentSecurityError(
-                f"Файл слишком большой! Максимальный размер: {settings.MAX_FILE_SIZE_BYTES // (1024*1024)} МБ."
+                f"Файл слишком большой! Максимальный размер: {settings.effective_max_file_size // (1024*1024)} МБ."
             )
 
         file_type = cls.detect_file_type(file_bytes, filename=original_name)
         sanitized_name = cls.sanitize_filename(original_name)
 
-        # Создаем папку спула при необходимости
-        settings.SPOOL_DIR.mkdir(parents=True, exist_ok=True)
-        dest_pdf_path = settings.SPOOL_DIR / f"{order_uuid}.pdf"
+        # Создаем папку спула при необходимости (с учетом защиты флеш-памяти)
+        spool_dir = settings.effective_spool_dir
+        spool_dir.mkdir(parents=True, exist_ok=True)
+        dest_pdf_path = spool_dir / f"{order_uuid}.pdf"
 
         if file_type == "pdf":
             dest_pdf_path.write_bytes(file_bytes)
@@ -173,10 +177,10 @@ class DocumentService:
             if total_pages <= 0:
                 raise DocumentSecurityError("В документе нет страниц для печати.")
 
-            if total_pages > settings.MAX_PAGES_PER_JOB:
+            if total_pages > settings.effective_max_pages:
                 raise DocumentSecurityError(
                     f"В документе {total_pages} страниц. "
-                    f"Максимум за одно задание: {settings.MAX_PAGES_PER_JOB} страниц."
+                    f"Максимум за одно задание: {settings.effective_max_pages} страниц."
                 )
 
             # Глубокая проверка целостности каждой страницы
@@ -231,17 +235,28 @@ class DocumentService:
     def convert_image_to_a4_pdf(cls, image_bytes: bytes, output_pdf_path: Path) -> int:
         """
         Конвертирует изображение (или многостраничный TIFF) в формат A4 PDF:
-        - Монохромная лазерная оптимизация (Grayscale 'L', экономия RAM и ускорение в 3x)
-        - Автоматическое отбеливание серого фона (экономия тонера)
-        - Стандартизированный формат A4 (300 DPI) с полями 80px
+        - Потоковая обработка O(1) RAM: в памяти удерживается не более 1 страницы,
+          что предотвращает OOM killer на роутерах с 128-256 МБ RAM (Netis NX31, Huawei AX3).
+        - Адаптивный DPI: 150 DPI в Low-Memory режиме (2.1 МБ/стр), 300 DPI на мощных серверах.
+        - Монохромная лазерная оптимизация (Grayscale 'L') и отбеливание серого фона.
         """
         try:
-            canvases: List[Image.Image] = []
+            dpi = settings.effective_dpi
+            resample_filter = Image.Resampling.BILINEAR if settings.is_low_memory else Image.Resampling.LANCZOS
+
+            # Базовые размеры A4 под заданный DPI
+            base_w = int(8.27 * dpi)
+            base_h = int(11.69 * dpi)
+            margin = max(20, int(80 * (dpi / 300.0)))
+
+            writer = pypdf.PdfWriter()
+            total_pages = 0
+
             with Image.open(io.BytesIO(image_bytes)) as img:
                 for frame in ImageSequence.Iterator(img):
-                    if len(canvases) >= settings.MAX_PAGES_PER_JOB:
+                    if total_pages >= settings.effective_max_pages:
                         raise DocumentSecurityError(
-                            f"Количество страниц в изображении превышает лимит ({settings.MAX_PAGES_PER_JOB})."
+                            f"Количество страниц в изображении превышает лимит ({settings.effective_max_pages})."
                         )
 
                     current = frame.copy()
@@ -260,16 +275,15 @@ class DocumentService:
                     if settings.ENHANCE_CONTRAST_PHOTOS:
                         gray_img = cls.enhance_document_image(gray_img)
 
-                    # Стандартный A4 при 300 DPI: 2480 x 3508 пикселей
-                    a4_w, a4_h = 2480, 3508
+                    # Расчет геометрии A4 (книжная / альбомная)
+                    page_w, page_h = base_w, base_h
                     if gray_img.width > gray_img.height:
-                        a4_w, a4_h = 3508, 2480  # Альбомная ориентация
+                        page_w, page_h = base_h, base_w  # Альбомная ориентация
 
                     img_ratio = gray_img.width / gray_img.height
-                    page_ratio = a4_w / a4_h
-                    margin = 80  # Отступ 80px
-                    target_w = a4_w - 2 * margin
-                    target_h = a4_h - 2 * margin
+                    page_ratio = page_w / page_h
+                    target_w = page_w - 2 * margin
+                    target_h = page_h - 2 * margin
 
                     if img_ratio > page_ratio:
                         new_w = target_w
@@ -278,26 +292,37 @@ class DocumentService:
                         new_h = target_h
                         new_w = int(target_h * img_ratio)
 
-                    resized = gray_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-                    canvas = Image.new("L", (a4_w, a4_h), 255)
-                    offset_x = (a4_w - new_w) // 2
-                    offset_y = (a4_h - new_h) // 2
+                    resized = gray_img.resize((new_w, new_h), resample_filter)
+                    canvas = Image.new("L", (page_w, page_h), 255)
+                    offset_x = (page_w - new_w) // 2
+                    offset_y = (page_h - new_h) // 2
                     canvas.paste(resized, (offset_x, offset_y))
-                    canvases.append(canvas)
 
-            if not canvases:
+                    # Потоковая запись страницы в PDF без накопления растровых холстов в RAM
+                    page_buf = io.BytesIO()
+                    canvas.save(page_buf, "PDF", resolution=float(dpi), quality=95)
+                    page_buf.seek(0)
+                    page_reader = pypdf.PdfReader(page_buf)
+                    writer.add_page(page_reader.pages[0])
+                    total_pages += 1
+
+                    # Мгновенная утилизация объектов в памяти текущей страницы (O(1) footprint)
+                    del canvas, resized, gray_img, current, page_reader, page_buf
+                    if settings.is_low_memory:
+                        gc.collect()
+
+            if total_pages == 0:
                 raise DocumentSecurityError("Не удалось извлечь ни одной страницы из изображения.")
 
-            # Сохраняем в оптимизированный монохромный PDF
-            canvases[0].save(
-                str(output_pdf_path),
-                "PDF",
-                save_all=True,
-                append_images=canvases[1:] if len(canvases) > 1 else [],
-                resolution=300.0,
-                quality=95
-            )
-            return len(canvases)
+            # Сохраняем в целевой PDF файл
+            with open(str(output_pdf_path), "wb") as f:
+                writer.write(f)
+            writer.close()
+
+            if settings.is_low_memory:
+                gc.collect()
+
+            return total_pages
 
         except DocumentSecurityError:
             raise
@@ -309,7 +334,7 @@ class DocumentService:
     def convert_txt_to_a4_pdf(cls, text_bytes: bytes, output_pdf_path: Path) -> int:
         """
         Конвертирует текстовый файл (.txt) в стандартизированный A4 PDF
-        с автоматической разбивкой на страницы, полями и нумерацией.
+        с потоковой разбивкой на страницы, полями и нумерацией (O(1) по RAM).
         """
         try:
             # Определение кодировки
@@ -343,43 +368,63 @@ class DocumentService:
                 for i in range(0, max(len(wrapped_lines), 1), lines_per_page)
             ]
 
-            if len(pages_chunks) > settings.MAX_PAGES_PER_JOB:
+            if len(pages_chunks) > settings.effective_max_pages:
                 raise DocumentSecurityError(
                     f"Текстовый документ слишком длинный ({len(pages_chunks)} стр.). "
-                    f"Максимум: {settings.MAX_PAGES_PER_JOB} стр."
+                    f"Максимум: {settings.effective_max_pages} стр."
                 )
 
-            font = ImageFont.load_default(size=40)
-            header_font = ImageFont.load_default(size=32)
+            dpi = settings.effective_dpi
+            scale = dpi / 300.0
+            a4_w = int(2480 * scale)
+            a4_h = int(3508 * scale)
+            margin_x = int(160 * scale)
+            header_y = int(100 * scale)
+            line_y = int(150 * scale)
+            line_end_x = int(2320 * scale)
+            start_y = int(190 * scale)
+            step_y = max(25, int(65 * scale))
 
-            page_images: List[Image.Image] = []
+            font = ImageFont.load_default(size=max(14, int(40 * scale)))
+            header_font = ImageFont.load_default(size=max(12, int(32 * scale)))
+
+            writer = pypdf.PdfWriter()
+            total_pages = len(pages_chunks)
+
             for p_idx, page_lines in enumerate(pages_chunks):
-                # Создаем монохромный лист A4 (2480 x 3508, 1 байт на пиксель)
-                img = Image.new("L", (2480, 3508), 255)
+                # Создаем монохромный лист A4 (1 байт на пиксель)
+                img = Image.new("L", (a4_w, a4_h), 255)
                 draw = ImageDraw.Draw(img)
 
                 # Колонтитул: номер страницы
-                header_text = f"Страница {p_idx + 1} из {len(pages_chunks)}"
-                draw.text((160, 100), header_text, font=header_font, fill=110)
-                draw.line([(160, 150), (2320, 150)], fill=190, width=2)
+                header_text = f"Страница {p_idx + 1} из {total_pages}"
+                draw.text((margin_x, header_y), header_text, font=header_font, fill=110)
+                draw.line([(margin_x, line_y), (line_end_x, line_y)], fill=190, width=max(1, int(2 * scale)))
 
-                y = 190
+                y = start_y
                 for line in page_lines:
-                    draw.text((160, y), line, font=font, fill=0)
-                    y += 65
+                    draw.text((margin_x, y), line, font=font, fill=0)
+                    y += step_y
 
-                page_images.append(img)
+                # Потоковое добавление страницы в PDF
+                page_buf = io.BytesIO()
+                img.save(page_buf, "PDF", resolution=float(dpi))
+                page_buf.seek(0)
+                page_reader = pypdf.PdfReader(page_buf)
+                writer.add_page(page_reader.pages[0])
 
-            if page_images:
-                page_images[0].save(
-                    str(output_pdf_path),
-                    "PDF",
-                    save_all=True,
-                    append_images=page_images[1:] if len(page_images) > 1 else [],
-                    resolution=300.0
-                )
+                del img, draw, page_reader, page_buf
+                if settings.is_low_memory:
+                    gc.collect()
 
-            return len(pages_chunks)
+            with open(str(output_pdf_path), "wb") as f:
+                writer.write(f)
+            writer.close()
+
+            if settings.is_low_memory:
+                gc.collect()
+
+            return total_pages
 
         except DocumentSecurityError:
             raise
@@ -414,7 +459,7 @@ class DocumentService:
         import subprocess
         soffice_bin = shutil.which("soffice") or shutil.which("libreoffice")
         if soffice_bin:
-            temp_docx = settings.SPOOL_DIR / f"{order_uuid}.docx"
+            temp_docx = settings.effective_spool_dir / f"{order_uuid}.docx"
             try:
                 temp_docx.write_bytes(file_bytes)
                 os.chmod(temp_docx, 0o600)
@@ -422,7 +467,7 @@ class DocumentService:
                     soffice_bin,
                     "--headless",
                     "--convert-to", "pdf",
-                    "--outdir", str(settings.SPOOL_DIR),
+                    "--outdir", str(settings.effective_spool_dir),
                     str(temp_docx)
                 ]
                 proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25)
@@ -608,7 +653,7 @@ class DocumentService:
         if not needs_slicing and not needs_copies_duplication and not settings.PAGE_FIT_A4:
             return source_pdf
 
-        dest_sliced_path = settings.SPOOL_DIR / f"{order_uuid}_prepared.pdf"
+        dest_sliced_path = settings.effective_spool_dir / f"{order_uuid}_prepared.pdf"
         writer = pypdf.PdfWriter()
 
         copies_to_add = copies if needs_copies_duplication else 1
@@ -631,6 +676,10 @@ class DocumentService:
 
         with open(str(dest_sliced_path), "wb") as out_f:
             writer.write(out_f)
+        writer.close()
+
+        if settings.is_low_memory:
+            gc.collect()
 
         os.chmod(dest_sliced_path, 0o600)
         return dest_sliced_path

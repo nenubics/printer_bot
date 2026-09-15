@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import logging
 from pathlib import Path
 from typing import Optional
@@ -173,6 +174,8 @@ class PrintQueueWorker:
                 await Repository.update_order_status(session, order_id, OrderStatus.COMPLETED)
                 # Безопасно удаляем исходный файл с диска
                 DocumentService.cleanup_file(str(file_path))
+                if settings.is_low_memory:
+                    gc.collect()
 
                 # Учет расхода бумаги в лотке Pantum BP2300NW
                 printed_sheets = order.pages_to_print_count * copies

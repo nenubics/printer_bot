@@ -14,11 +14,12 @@ from services.printer import PrinterService
 
 async def run_healthcheck() -> int:
     # 1. Проверка доступности папки спула и свободного места на диске
-    settings.SPOOL_DIR.mkdir(parents=True, exist_ok=True)
-    disk_usage = shutil.disk_usage(settings.DATA_DIR)
+    settings.effective_spool_dir.mkdir(parents=True, exist_ok=True)
+    check_dir = settings.effective_spool_dir if settings.effective_spool_dir.exists() else settings.DATA_DIR
+    disk_usage = shutil.disk_usage(check_dir)
     free_mb = disk_usage.free / (1024 * 1024)
-    if free_mb < 200:
-        print(f"CRITICAL: Low disk space! Free: {free_mb:.1f} MB")
+    if free_mb < settings.effective_min_free_disk_mb:
+        print(f"CRITICAL: Low disk space! Free: {free_mb:.1f} MB (min required: {settings.effective_min_free_disk_mb} MB)")
         return 1
 
     # 2. Проверка базы данных SQLite и WAL-файлов

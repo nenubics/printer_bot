@@ -23,20 +23,32 @@ engine: AsyncEngine = create_async_engine(
 @event.listens_for(engine.sync_engine, "connect")
 def set_sqlite_pragma(dbapi_connection, connection_record):
     """
-    Настройка критически важных PRAGMA для SQLite:
+    Настройка критически важных PRAGMA для SQLite с адаптацией под оборудование:
     1. WAL-режим (Write-Ahead Logging) — обеспечивает параллельное чтение и запись без блокировок.
     2. synchronous = NORMAL — ускорение I/O при сохранении целостности.
     3. foreign_keys = ON — включение целостности связей.
     4. busy_timeout = 10000 (10 секунд) — предотвращение 'database is locked'.
+    5. Адаптивное управление RAM:
+       - В Low-Memory / OpenWrt режиме: cache 2 МБ, mmap отключен (предотвращает OOM и фрагментацию на 32-bit MIPS/ARM),
+         temp_store = FILE, частый autocheckpoint.
+       - В High-Performance режиме: cache 64 МБ, mmap 256 МБ, temp_store = MEMORY.
     """
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode = WAL;")
     cursor.execute("PRAGMA synchronous = NORMAL;")
     cursor.execute("PRAGMA foreign_keys = ON;")
     cursor.execute("PRAGMA busy_timeout = 10000;")
-    cursor.execute("PRAGMA cache_size = -64000;")    # 64 MB памяти под кэш страниц
-    cursor.execute("PRAGMA mmap_size = 268435456;")  # 256 MB memory-mapped I/O
-    cursor.execute("PRAGMA temp_store = MEMORY;")    # Временные таблицы и сортировки в RAM
+
+    if settings.is_low_memory:
+        cursor.execute("PRAGMA cache_size = -2000;")       # 2 MB памяти под кэш страниц
+        cursor.execute("PRAGMA mmap_size = 0;")           # Отключение mmap для сохранения памяти роутера
+        cursor.execute("PRAGMA temp_store = FILE;")       # Временные таблицы на диске/tmpfs
+        cursor.execute("PRAGMA wal_autocheckpoint = 100;")  # Частый сброс WAL
+    else:
+        cursor.execute("PRAGMA cache_size = -64000;")     # 64 MB памяти под кэш страниц
+        cursor.execute("PRAGMA mmap_size = 268435456;")   # 256 MB memory-mapped I/O
+        cursor.execute("PRAGMA temp_store = MEMORY;")     # Временные таблицы и сортировки в RAM
+
     cursor.close()
 
 
@@ -51,10 +63,10 @@ async def init_db() -> None:
     """Инициализация базы данных: создание таблиц и дефолтных настроек с защитой прав доступа (0700 / 0600)"""
     import os
     settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    settings.SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+    settings.effective_spool_dir.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(settings.DATA_DIR, 0o700)
-        os.chmod(settings.SPOOL_DIR, 0o700)
+        os.chmod(settings.effective_spool_dir, 0o700)
     except Exception:
         pass
 

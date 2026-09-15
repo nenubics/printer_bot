@@ -80,10 +80,10 @@ async def handle_document_upload(message: Message, bot: Bot, session: AsyncSessi
         file_id = photo.file_id
 
     # Проверка размера на уровне Telegram метаданных
-    if file_size > settings.MAX_FILE_SIZE_BYTES:
+    if file_size > settings.effective_max_file_size:
         await status_msg.edit_text(
             f"❌ <b>Файл слишком большой!</b>\n"
-            f"Максимальный размер: {settings.MAX_FILE_SIZE_BYTES // (1024*1024)} МБ.",
+            f"Максимальный размер: {settings.effective_max_file_size // (1024*1024)} МБ.",
             parse_mode="HTML"
         )
         return

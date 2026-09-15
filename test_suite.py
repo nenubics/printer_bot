@@ -1,8 +1,10 @@
+import asyncio
 import io
 import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch, AsyncMock, MagicMock
 from pathlib import Path
 from PIL import Image, ImageDraw
 import pypdf
@@ -381,5 +383,153 @@ class TestEcoAndPerformanceOptimizations(unittest.IsolatedAsyncioTestCase):
         await engine.dispose()
 
 
+class TestLowMemoryAndRouterOptimization(unittest.IsolatedAsyncioTestCase):
+    async def test_low_memory_config_and_autodetect(self):
+        orig_low = settings.LOW_MEMORY_MODE
+        orig_dpi = settings.RENDER_DPI
+        try:
+            settings.LOW_MEMORY_MODE = True
+            settings.RENDER_DPI = 0
+            self.assertTrue(settings.is_low_memory)
+            self.assertEqual(settings.effective_dpi, 150)
+            self.assertEqual(settings.effective_max_pages, 40)
+            self.assertEqual(settings.effective_max_file_size, 15 * 1024 * 1024)
+            self.assertEqual(settings.effective_min_free_disk_mb, 25)
+            self.assertEqual(settings.effective_spool_dir, Path("/tmp/printer_bot_spool"))
+
+            # Проверка возврата в desktop режим
+            settings.LOW_MEMORY_MODE = False
+            self.assertFalse(settings.is_low_memory)
+            self.assertEqual(settings.effective_dpi, 300)
+            self.assertEqual(settings.effective_max_pages, 200)
+        finally:
+            settings.LOW_MEMORY_MODE = orig_low
+            settings.RENDER_DPI = orig_dpi
+
+    async def test_streaming_image_conversion_low_memory(self):
+        orig_low = settings.LOW_MEMORY_MODE
+        orig_spool = settings.SPOOL_DIR
+        temp_dir = Path(tempfile.mkdtemp())
+        try:
+            settings.LOW_MEMORY_MODE = True
+            settings.SPOOL_DIR = temp_dir / "spool"
+
+            # Создаем тестовое изображение
+            img_bytes = create_dummy_image("PNG", size=(600, 800))
+            dest_pdf = temp_dir / "test_stream_img.pdf"
+
+            pages = DocumentService.convert_image_to_a4_pdf(img_bytes, dest_pdf)
+            self.assertEqual(pages, 1)
+            self.assertTrue(dest_pdf.exists())
+
+            # Проверяем геометрию созданного PDF
+            reader = pypdf.PdfReader(str(dest_pdf))
+            self.assertEqual(len(reader.pages), 1)
+            mbox = reader.pages[0].mediabox
+            # При 150 DPI A4 = 595.2 x 841.92 pt
+            self.assertAlmostEqual(float(mbox.width), 595.2, delta=1.0)
+            self.assertAlmostEqual(float(mbox.height), 841.92, delta=1.0)
+        finally:
+            settings.LOW_MEMORY_MODE = orig_low
+            settings.SPOOL_DIR = orig_spool
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    async def test_streaming_txt_conversion_low_memory(self):
+        orig_low = settings.LOW_MEMORY_MODE
+        orig_spool = settings.SPOOL_DIR
+        temp_dir = Path(tempfile.mkdtemp())
+        try:
+            settings.LOW_MEMORY_MODE = True
+            settings.SPOOL_DIR = temp_dir / "spool"
+
+            # Генерируем текст на 2 страницы (60 строк)
+            text_content = "\n".join([f"Строка отчета {i}: Тестирование OpenWrt Netis NX31" for i in range(1, 65)])
+            dest_pdf = temp_dir / "test_stream_txt.pdf"
+
+            pages = DocumentService.convert_txt_to_a4_pdf(text_content.encode("utf-8"), dest_pdf)
+            self.assertEqual(pages, 2)
+            self.assertTrue(dest_pdf.exists())
+
+            reader = pypdf.PdfReader(str(dest_pdf))
+            self.assertEqual(len(reader.pages), 2)
+        finally:
+            settings.LOW_MEMORY_MODE = orig_low
+            settings.SPOOL_DIR = orig_spool
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    async def test_adaptive_sqlite_pragmas(self):
+        orig_low = settings.LOW_MEMORY_MODE
+        temp_dir = Path(tempfile.mkdtemp())
+        try:
+            settings.LOW_MEMORY_MODE = True
+            from database.db import set_sqlite_pragma
+            import sqlite3
+
+            test_db = temp_dir / "test_pragma.db"
+            conn = sqlite3.connect(str(test_db))
+            set_sqlite_pragma(conn, None)
+            cursor = conn.cursor()
+
+            # В Low-Memory режиме:
+            cache_size = cursor.execute("PRAGMA cache_size;").fetchone()[0]
+            mmap_size = cursor.execute("PRAGMA mmap_size;").fetchone()[0]
+            temp_store = cursor.execute("PRAGMA temp_store;").fetchone()[0]
+
+            self.assertEqual(cache_size, -2000)  # 2 МБ кэш
+            self.assertEqual(mmap_size, 0)      # mmap отключен для роутеров
+            self.assertEqual(temp_store, 1)    # FILE temp store (0=DEFAULT, 1=FILE, 2=MEMORY)
+            cursor.close()
+            conn.close()
+        finally:
+            settings.LOW_MEMORY_MODE = orig_low
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    async def test_chunked_raw_socket_streaming(self):
+        # Проверка потоковой чанковой передачи по 64 КБ без открытия внешних сокетов
+        temp_dir = Path(tempfile.mkdtemp())
+        orig_host = settings.PRINTER_HOST
+        orig_port = settings.PRINTER_PORT
+        try:
+            settings.PRINTER_HOST = "192.168.3.13"
+            settings.PRINTER_PORT = 9100
+
+            # Создаем тестовый файл размером ~130 КБ (требует 3 чанка: 64КБ + 64КБ + остаток)
+            test_pdf = temp_dir / "mock_stream.pdf"
+            sample_content = b"%PDF-1.4 " + (b"X" * 131072) + b" %%EOF"
+            test_pdf.write_bytes(sample_content)
+
+            mock_reader = AsyncMock()
+            # Имитация отсутствия раннего сброса соединения (read возвращает таймаут)
+            mock_reader.read = AsyncMock(side_effect=asyncio.TimeoutError())
+
+            sent_chunks = []
+            mock_writer = MagicMock()
+            mock_writer.write = MagicMock(side_effect=lambda data: sent_chunks.append(data))
+            mock_writer.drain = AsyncMock()
+            mock_writer.close = MagicMock()
+            mock_writer.wait_closed = AsyncMock()
+
+            with patch("asyncio.open_connection", new_callable=AsyncMock) as mock_connect:
+                mock_connect.return_value = (mock_reader, mock_writer)
+                success, msg, job_id = await PrinterService._print_raw(test_pdf)
+
+                self.assertTrue(success)
+                self.assertIn("RAW-SOCKET-JOB", job_id)
+
+                # Проверяем целостность переданных данных
+                full_sent = b"".join(sent_chunks)
+                self.assertEqual(full_sent, sample_content)
+
+                # Проверяем, что файл передавался блоками по 64 КБ (защита RAM роутера)
+                self.assertGreaterEqual(len(sent_chunks), 2)
+                for chunk in sent_chunks[:-1]:
+                    self.assertEqual(len(chunk), 65536)
+        finally:
+            settings.PRINTER_HOST = orig_host
+            settings.PRINTER_PORT = orig_port
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
+
