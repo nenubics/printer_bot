@@ -43,7 +43,7 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
         cursor.execute("PRAGMA cache_size = -2000;")       # 2 MB памяти под кэш страниц
         cursor.execute("PRAGMA mmap_size = 0;")           # Отключение mmap для сохранения памяти роутера
         cursor.execute("PRAGMA temp_store = FILE;")       # Временные таблицы на диске/tmpfs
-        cursor.execute("PRAGMA wal_autocheckpoint = 100;")  # Частый сброс WAL
+        cursor.execute("PRAGMA wal_autocheckpoint = 50;")   # Частый сброс WAL (каждые 200 КБ)
     else:
         cursor.execute("PRAGMA cache_size = -64000;")     # 64 MB памяти под кэш страниц
         cursor.execute("PRAGMA mmap_size = 268435456;")   # 256 MB memory-mapped I/O

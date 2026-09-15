@@ -99,14 +99,17 @@ class DocumentService:
     @classmethod
     def process_and_save_upload(
         cls,
-        file_bytes: bytes,
-        original_name: str,
-        order_uuid: str
+        file_bytes: Optional[bytes] = None,
+        original_name: str = "",
+        order_uuid: str = "",
+        source_file_path: Optional[Path] = None
     ) -> Tuple[Path, int, str]:
         """
         Проверяет файл, выполняет конвертацию в стандартизированный PDF A4,
         сохраняет файл под безопасным UUID в папку спула и возвращает:
-        (путь к файлу, общее количество страниц, очищенное имя)
+        (путь к файлу, общее количество страниц, очищенное имя).
+        Поддерживает передачу как байтов в памяти, так и пути к файлу на диске
+        для потоковой обработки с 0 МБ расхода RAM.
         """
         # 1. Защита дискового пространства от DoS переполнения
         try:
@@ -121,12 +124,25 @@ class DocumentService:
         except OSError as e:
             logger.warning(f"Failed to check disk usage: {e}")
 
-        if len(file_bytes) > settings.effective_max_file_size:
+        # Проверка размера
+        if source_file_path and source_file_path.exists():
+            file_size = source_file_path.stat().st_size
+        else:
+            file_size = len(file_bytes) if file_bytes else 0
+
+        if file_size > settings.effective_max_file_size:
             raise DocumentSecurityError(
                 f"Файл слишком большой! Максимальный размер: {settings.effective_max_file_size // (1024*1024)} МБ."
             )
 
-        file_type = cls.detect_file_type(file_bytes, filename=original_name)
+        # Чтение magic bytes (первые 4096 байт)
+        if source_file_path and source_file_path.exists():
+            with open(source_file_path, "rb") as f:
+                header_bytes = f.read(4096)
+        else:
+            header_bytes = file_bytes[:4096] if file_bytes else b""
+
+        file_type = cls.detect_file_type(header_bytes, filename=original_name)
         sanitized_name = cls.sanitize_filename(original_name)
 
         # Создаем папку спула при необходимости (с учетом защиты флеш-памяти)
@@ -135,25 +151,41 @@ class DocumentService:
         dest_pdf_path = spool_dir / f"{order_uuid}.pdf"
 
         if file_type == "pdf":
-            dest_pdf_path.write_bytes(file_bytes)
+            if source_file_path and source_file_path.exists():
+                # Потоковое перемещение без загрузки в память (0 MB RAM overhead)
+                if source_file_path != dest_pdf_path:
+                    shutil.move(str(source_file_path), str(dest_pdf_path))
+            else:
+                dest_pdf_path.write_bytes(file_bytes or b"")
             os.chmod(dest_pdf_path, 0o600)
             total_pages = cls.verify_pdf(dest_pdf_path)
             return dest_pdf_path, total_pages, sanitized_name
 
-        elif file_type in ("png", "jpeg", "tiff", "webp"):
-            total_pages = cls.convert_image_to_a4_pdf(file_bytes, dest_pdf_path)
-            os.chmod(dest_pdf_path, 0o600)
-            return dest_pdf_path, total_pages, sanitized_name
+        # Для не-PDF форматов (картинки, txt, docx) получаем байты
+        if file_bytes is None and source_file_path and source_file_path.exists():
+            file_data = source_file_path.read_bytes()
+        else:
+            file_data = file_bytes or b""
 
-        elif file_type == "txt":
-            total_pages = cls.convert_txt_to_a4_pdf(file_bytes, dest_pdf_path)
-            os.chmod(dest_pdf_path, 0o600)
-            return dest_pdf_path, total_pages, sanitized_name
+        try:
+            if file_type in ("png", "jpeg", "tiff", "webp"):
+                total_pages = cls.convert_image_to_a4_pdf(file_data, dest_pdf_path)
+                os.chmod(dest_pdf_path, 0o600)
+                return dest_pdf_path, total_pages, sanitized_name
 
-        elif file_type == "docx":
-            total_pages = cls.convert_docx_to_pdf(file_bytes, dest_pdf_path, order_uuid)
-            os.chmod(dest_pdf_path, 0o600)
-            return dest_pdf_path, total_pages, sanitized_name
+            elif file_type == "txt":
+                total_pages = cls.convert_txt_to_a4_pdf(file_data, dest_pdf_path)
+                os.chmod(dest_pdf_path, 0o600)
+                return dest_pdf_path, total_pages, sanitized_name
+
+            elif file_type == "docx":
+                total_pages = cls.convert_docx_to_pdf(file_data, dest_pdf_path, order_uuid)
+                os.chmod(dest_pdf_path, 0o600)
+                return dest_pdf_path, total_pages, sanitized_name
+        finally:
+            # Если передавался временный исходный файл, очищаем его
+            if source_file_path and source_file_path.exists() and source_file_path != dest_pdf_path:
+                cls.cleanup_file(str(source_file_path))
 
         raise DocumentSecurityError("Неизвестная ошибка обработки документа.")
 

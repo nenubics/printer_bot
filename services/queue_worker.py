@@ -32,6 +32,7 @@ class PrintQueueWorker:
         self._task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
         self._new_job_event = asyncio.Event()
+        self._last_backup_time: float = 0.0
         _global_worker = self
 
     def notify_new_job(self) -> None:
@@ -69,6 +70,11 @@ class PrintQueueWorker:
                 if cleanup_counter >= 30:
                     cleanup_counter = 0
                     await self._cleanup_expired_jobs()
+                    import time
+                    now_ts = time.monotonic()
+                    if now_ts - self._last_backup_time > 86400:
+                        self._last_backup_time = now_ts
+                        await Repository.backup_database()
 
             except asyncio.CancelledError:
                 break

@@ -108,7 +108,7 @@ class PrinterService:
 
     @classmethod
     async def _check_raw_status(cls) -> Dict[str, Any]:
-        """Проверка доступности сетевого сокета принтера (Port 9100)"""
+        """Проверка доступности сетевого сокета принтера (Port 9100) с учетом режима Deep Sleep"""
         host = settings.PRINTER_HOST
         port = settings.PRINTER_PORT
         if not host:
@@ -119,29 +119,34 @@ class PrinterService:
             }
 
         loop = asyncio.get_running_loop()
-        sock = None
-        try:
-            # Пробуем подключиться к порту с таймаутом 2.5 секунды
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setblocking(False)
-            await asyncio.wait_for(loop.sock_connect(sock, (host, port)), timeout=2.5)
-            return {
-                "is_ready": True,
-                "state": "online",
-                "message": f"Сетевой принтер доступен по {host}:{port}"
-            }
-        except (socket.error, asyncio.TimeoutError) as e:
-            return {
-                "is_ready": False,
-                "state": "offline",
-                "message": f"Принтер {host}:{port} недоступен в сети: {e}"
-            }
-        finally:
-            if sock:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
+        last_err = None
+        for attempt in range(1, 4):
+            sock = None
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setblocking(False)
+                await asyncio.wait_for(loop.sock_connect(sock, (host, port)), timeout=2.5)
+                return {
+                    "is_ready": True,
+                    "state": "online",
+                    "message": f"Сетевой принтер доступен по {host}:{port}"
+                }
+            except (socket.error, asyncio.TimeoutError) as e:
+                last_err = e
+                if attempt < 3:
+                    await asyncio.sleep(0.5)
+            finally:
+                if sock:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+
+        return {
+            "is_ready": False,
+            "state": "offline",
+            "message": f"Принтер {host}:{port} недоступен в сети: {last_err}"
+        }
 
     @classmethod
     async def print_job(
@@ -184,6 +189,7 @@ class PrinterService:
         selected_pages: str,
         title: str
     ) -> Tuple[bool, str, Optional[str]]:
+        printer = settings.PRINTER_NAME
         safe_title = re.sub(r'[^a-zA-Z0-9_\-]', '_', title)[:32] or "PrintJob"
         args = [
             "lp",
@@ -237,38 +243,46 @@ class PrinterService:
         """
         Потоковая отправка байтов напрямую в сетевой сокет принтера (Port 9100 JetDirect):
         - Чанковая потоковая передача блоками по 64 КБ: не загружает весь файл в память роутера.
-        - Быстрая проверка живости сокета перед передачей.
+        - Адаптивный механизм повторов (до 3 попыток) для пробуждения принтера из энергосберегающего сна (Deep Sleep).
         """
         host = settings.PRINTER_HOST
         port = settings.PRINTER_PORT
         if not host:
             return False, "Не задан PRINTER_HOST для прямого сокета.", None
 
-        try:
-            reader, writer = await asyncio.open_connection(host, port)
-
-            # Проверяем, не разорвал ли принтер соединение сразу
+        last_error = None
+        for attempt in range(1, 4):
             try:
-                probe = await asyncio.wait_for(reader.read(1), timeout=0.05)
-                if probe == b"":
-                    writer.close()
-                    await writer.wait_closed()
-                    raise ConnectionResetError("Принтер сбросил сетевое соединение.")
-            except asyncio.TimeoutError:
-                # Таймаут ожидаем: сетевой принтер слушает порт и не шлет данные первым
-                pass
+                reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=4.0)
 
-            # Потоковая отправка блоками по 64 КБ для защиты RAM роутера
-            with open(str(pdf_path), "rb") as f:
-                while chunk := f.read(65536):
-                    writer.write(chunk)
-                    await writer.drain()
+                # Проверяем, не разорвал ли принтер соединение сразу
+                try:
+                    probe = await asyncio.wait_for(reader.read(1), timeout=0.05)
+                    if probe == b"":
+                        writer.close()
+                        await writer.wait_closed()
+                        raise ConnectionResetError("Принтер сбросил сетевое соединение.")
+                except asyncio.TimeoutError:
+                    # Таймаут ожидаем: сетевой принтер слушает порт и не шлет данные первым
+                    pass
 
-            writer.close()
-            await writer.wait_closed()
-            return True, f"Файл успешно передан на сетевой порт {host}:{port}", "RAW-SOCKET-JOB"
-        except Exception as e:
-            logger.error(f"Raw socket print failed: {e}", exc_info=True)
-            return False, f"Сбой отправки на сокет принтера: {e}", None
+                # Потоковая отправка блоками по 64 КБ для защиты RAM роутера
+                with open(str(pdf_path), "rb") as f:
+                    while chunk := f.read(65536):
+                        writer.write(chunk)
+                        await writer.drain()
+
+                writer.close()
+                await writer.wait_closed()
+                return True, f"Файл успешно передан на сетевой порт {host}:{port}", "RAW-SOCKET-JOB"
+
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Raw socket attempt {attempt}/3 failed: {e}. Retrying...")
+                if attempt < 3:
+                    await asyncio.sleep(attempt * 0.8)
+
+        logger.error(f"Raw socket print failed after 3 attempts: {last_error}", exc_info=True)
+        return False, f"Сбой отправки на сокет принтера (3 попытки): {last_error}", None
 
 

@@ -62,6 +62,12 @@ pip3 install --no-cache-dir \
     "pypdf>=5.3.0" \
     "qrcode>=8.0"
 
+# Очистка неиспользуемых файлов для жесткой экономии флеш-памяти роутера
+echo "[*] Очистка кэша компилятора, тестов и dist-info для экономии флеш-памяти..."
+find "$INSTALL_DIR" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+find "$INSTALL_DIR" -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
+find "$INSTALL_DIR" -type f -name "*.pyc" -delete 2>/dev/null || true
+
 # 5. Установка и регистрация procd сервиса
 echo "[5/6] Настройка службы автозапуска procd..."
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

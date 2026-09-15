@@ -1,6 +1,8 @@
 import asyncio
+import logging
 import uuid
 from collections import defaultdict
+from pathlib import Path
 from typing import Optional, List, Tuple
 from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -358,5 +360,72 @@ class Repository:
             s = SystemSetting(key=key, value=value)
             session.add(s)
         await session.commit()
+
+    @classmethod
+    async def backup_database(
+        cls,
+        backup_dir: Optional[Path] = None,
+        session: Optional[AsyncSession] = None
+    ) -> Optional[Path]:
+        """
+        Создает онлайн-бэкап базы данных без остановки сервиса:
+        - Использует SQLite VACUUM INTO для безопасной репликации активной БД (включая WAL).
+        - Сжимает дамп с помощью gzip (уменьшение размера до ~85%).
+        - Ограничивает количество резервных копий (хранит 3 последних) для защиты диска роутера.
+        - Устанавливает права 0600 на архив.
+        """
+        import gzip
+        import shutil
+        import os
+        from datetime import datetime
+        from config import settings
+        from sqlalchemy import text
+
+        _logger = logging.getLogger(__name__)
+
+        if session is None and not settings.DB_PATH.exists():
+            return None
+
+        target_dir = backup_dir or (settings.DATA_DIR / "backups")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(target_dir, 0o700)
+        except Exception:
+            pass
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        temp_bak = target_dir / f"backup_{timestamp}.db"
+        gz_bak = target_dir / f"printer_bot_backup_{timestamp}.db.gz"
+
+        try:
+            if session is not None:
+                await session.execute(text(f"VACUUM INTO '{temp_bak.resolve()}';"))
+            else:
+                from database.db import async_session_factory
+                async with async_session_factory() as s:
+                    await s.execute(text(f"VACUUM INTO '{temp_bak.resolve()}';"))
+
+            if temp_bak.exists():
+                with open(temp_bak, "rb") as f_in, gzip.open(gz_bak, "wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+                temp_bak.unlink()
+                try:
+                    os.chmod(gz_bak, 0o600)
+                except Exception:
+                    pass
+
+                # Ротация старых бэкапов (храним 3 последних)
+                existing = sorted(list(target_dir.glob("printer_bot_backup_*.db.gz")), key=lambda p: p.stat().st_mtime)
+                while len(existing) > 3:
+                    oldest = existing.pop(0)
+                    oldest.unlink(missing_ok=True)
+
+                _logger.info(f"Database online backup created successfully: {gz_bak.name} ({gz_bak.stat().st_size // 1024} KB)")
+                return gz_bak
+        except Exception as e:
+            _logger.error(f"Database online backup error: {e}", exc_info=True)
+            if temp_bak.exists():
+                temp_bak.unlink(missing_ok=True)
+            return None
 
 

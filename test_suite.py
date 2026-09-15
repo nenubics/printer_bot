@@ -529,7 +529,111 @@ class TestLowMemoryAndRouterOptimization(unittest.IsolatedAsyncioTestCase):
             settings.PRINTER_PORT = orig_port
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    async def test_process_and_save_upload_streaming(self):
+        # Проверка прямого перемещения файла на диск без буферизации в RAM
+        temp_dir = Path(tempfile.mkdtemp())
+        orig_spool = settings.SPOOL_DIR
+        try:
+            settings.SPOOL_DIR = temp_dir / "spool"
+            raw_file = temp_dir / "test_raw_upload.pdf"
+            # Минимальный валидный PDF
+            writer = pypdf.PdfWriter()
+            writer.add_blank_page(width=595.2, height=841.92)
+            with open(raw_file, "wb") as f:
+                writer.write(f)
+
+            dest_path, total_pages, sanitized_name = DocumentService.process_and_save_upload(
+                original_name="MyDocument.pdf",
+                order_uuid="test-uuid-streaming",
+                source_file_path=raw_file
+            )
+
+            self.assertEqual(total_pages, 1)
+            self.assertEqual(sanitized_name, "MyDocument.pdf")
+            self.assertTrue(dest_path.exists())
+            self.assertFalse(raw_file.exists())  # Перемещен, исходного нет
+        finally:
+            settings.SPOOL_DIR = orig_spool
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    async def test_raw_socket_deep_sleep_retry(self):
+        # Проверка повторных попыток пробуждения принтера из энергосберегающего сна (Deep Sleep)
+        temp_dir = Path(tempfile.mkdtemp())
+        orig_host = settings.PRINTER_HOST
+        try:
+            settings.PRINTER_HOST = "192.168.3.13"
+            test_pdf = temp_dir / "retry_test.pdf"
+            test_pdf.write_bytes(b"%PDF-1.4 mock content %%EOF")
+
+            mock_reader = AsyncMock()
+            mock_reader.read = AsyncMock(side_effect=asyncio.TimeoutError())
+            mock_writer = MagicMock()
+            mock_writer.write = MagicMock()
+            mock_writer.drain = AsyncMock()
+            mock_writer.close = MagicMock()
+            mock_writer.wait_closed = AsyncMock()
+
+            # 1-я попытка таймаут (сон), 2-я успешная
+            attempts = 0
+            async def fake_open_connection(h, p):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise asyncio.TimeoutError("Deep sleep ASIC timeout")
+                return mock_reader, mock_writer
+
+            with patch("asyncio.open_connection", side_effect=fake_open_connection):
+                with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+                    success, msg, job_id = await PrinterService._print_raw(test_pdf)
+                    self.assertTrue(success)
+                    self.assertEqual(attempts, 2)
+                    mock_sleep.assert_awaited()
+        finally:
+            settings.PRINTER_HOST = orig_host
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    async def test_database_backup_online_gzip(self):
+        # Проверка онлайн бэкапа SQLite с gzip и ротацией до 3 копий
+        temp_dir = Path(tempfile.mkdtemp())
+        try:
+            import gzip
+            test_db = temp_dir / "test_backup.db"
+            test_engine = create_async_engine(f"sqlite+aiosqlite:///{test_db.resolve()}")
+            async with test_engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+
+            test_session_maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+            backup_dir = temp_dir / "backups"
+
+            async with test_session_maker() as session:
+                backup_file = await Repository.backup_database(backup_dir=backup_dir, session=session)
+
+            self.assertIsNotNone(backup_file)
+            self.assertTrue(backup_file.exists())
+            self.assertTrue(backup_file.name.endswith(".db.gz"))
+
+            # Проверяем, что бэкап распаковывается и данные являются валидной SQLite базой
+            with gzip.open(backup_file, "rb") as gz_in:
+                decompressed = gz_in.read()
+            self.assertTrue(decompressed.startswith(b"SQLite format 3"))
+
+            # Проверяем ротацию: создаем еще 4 фиктивных бэкапа и проверяем, что хранится максимум 3
+            for i in range(4):
+                dummy_bak = backup_dir / f"printer_bot_backup_20260916_00000{i}.db.gz"
+                dummy_bak.write_bytes(b"dummy")
+
+            async with test_session_maker() as session:
+                await Repository.backup_database(backup_dir=backup_dir, session=session)
+
+            remaining_backups = list(backup_dir.glob("printer_bot_backup_*.db.gz"))
+            self.assertLessEqual(len(remaining_backups), 3)
+
+            await test_engine.dispose()
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

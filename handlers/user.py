@@ -91,17 +91,16 @@ async def handle_document_upload(message: Message, bot: Bot, session: AsyncSessi
     order_uuid = str(uuid.uuid4())
 
     try:
-        # Скачиваем файл в память с таймаутом
+        # Потоковое скачивание напрямую на диск/tmpfs без буферизации всего файла в RAM
         file_info = await bot.get_file(file_id)
-        file_stream = io.BytesIO()
-        await bot.download_file(file_info.file_path, destination=file_stream)
-        file_bytes = file_stream.getvalue()
+        raw_tmp_path = settings.effective_spool_dir / f"{order_uuid}_raw"
+        await bot.download_file(file_info.file_path, destination=raw_tmp_path)
 
         # Безопасная валидация, санитизация и сохранение в спул
         dest_path, total_pages, sanitized_name = DocumentService.process_and_save_upload(
-            file_bytes=file_bytes,
             original_name=original_filename,
-            order_uuid=order_uuid
+            order_uuid=order_uuid,
+            source_file_path=raw_tmp_path
         )
 
     except DocumentSecurityError as e:
