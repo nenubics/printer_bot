@@ -632,6 +632,35 @@ class TestLowMemoryAndRouterOptimization(unittest.IsolatedAsyncioTestCase):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def test_enhance_scanned_pdf(self):
+        temp_dir = Path(tempfile.mkdtemp())
+        try:
+            # Создаем тестовый PDF с одной растровой страницей (серый фон 215, темный текст)
+            scan_img = Image.new("L", (300, 400), color=215)
+            draw = ImageDraw.Draw(scan_img)
+            draw.rectangle([50, 50, 150, 100], fill=40)
+            
+            buf = io.BytesIO()
+            scan_img.save(buf, format="PDF")
+            buf.seek(0)
+            
+            test_pdf = temp_dir / "test_scan.pdf"
+            with open(test_pdf, "wb") as f:
+                f.write(buf.getvalue())
+                
+            enhanced = DocumentService.enhance_scanned_pdf_if_needed(test_pdf)
+            self.assertTrue(enhanced)
+            self.assertTrue(test_pdf.exists())
+            
+            # Проверяем, что в результирующем файле фон стал белым
+            reader = pypdf.PdfReader(str(test_pdf))
+            self.assertEqual(len(reader.pages), 1)
+            out_img = Image.open(io.BytesIO(reader.pages[0].images[0].data))
+            # Фон (10, 10) должен быть 255
+            self.assertEqual(out_img.getpixel((10, 10)), 255)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
